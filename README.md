@@ -69,7 +69,9 @@ Vitest 使用 `@cloudflare/vitest-pool-workers` 执行 Worker/DO integration tes
 
 ## 配置与部署
 
-`wrangler.jsonc` 已声明两个 SQLite-backed Durable Object class 及 migration，但不包含 account ID、route 或真实域名。先编辑/通过部署环境提供普通 vars，然后设置 secret：
+测试实例：`https://proxy.example.com`。该实例仅用于验证 Worker/DO 的 bridge、session 和 WebSocket carrier 路径，固定 TCP 后端为无关的公开测试端点，**不是可用的 MTProxy 服务**；生产使用前必须替换为你控制的固定 MTProxy 后端。
+
+`wrangler.jsonc` 已声明两个 SQLite-backed Durable Object class 及 migration，但不包含 account ID、route、真实域名或密钥。先编辑/通过部署环境提供普通 vars，然后设置 secret：
 
 ```bash
 npx wrangler secret put WEB_SECRET
