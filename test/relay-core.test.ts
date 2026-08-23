@@ -58,15 +58,16 @@ describe('relay session state and flow control', () => {
     await expect(core.receive(encodeFrame(FrameType.Open, 5))).rejects.toThrow(/reuse/i);
   });
 
-  it('never permits an old stream id after bounded tombstone eviction', async () => {
+  it('permits stream id reuse after bounded tombstone eviction', async () => {
     const { core } = fixture({ maxClosedStreamIds: 2 });
     for (const id of [1, 2, 3]) await core.receive(new Uint8Array([...encodeFrame(FrameType.Open, id), ...encodeFrame(FrameType.Close, id)]));
-    await expect(core.receive(encodeFrame(FrameType.Open, 1))).rejects.toThrow(/reuse/i);
+    await expect(core.receive(encodeFrame(FrameType.Open, 1))).resolves.toBeUndefined();
   });
 
-  it('requires OPEN ids to increase even within one carrier batch', async () => {
-    const { core } = fixture();
-    await expect(core.receive(new Uint8Array([...encodeFrame(FrameType.Open, 2), ...encodeFrame(FrameType.Open, 1)]))).rejects.toThrow(/reuse/i);
+  it('accepts out-of-order fresh OPEN ids in one carrier batch', async () => {
+    const { core, connector } = fixture();
+    await expect(core.receive(new Uint8Array([...encodeFrame(FrameType.Open, 2), ...encodeFrame(FrameType.Open, 1)]))).resolves.toBeUndefined();
+    expect(connector.open).toHaveBeenCalledTimes(2);
   });
 
   it('closes only an over-limit OPEN and preserves the session', async () => {
@@ -99,6 +100,63 @@ describe('relay session state and flow control', () => {
     const windows = sent.flatMap(parseRelayBatch).filter((frame) => frame.type === FrameType.Window);
     expect(windows).toHaveLength(1);
     expect(new DataView(windows[0]!.payload.buffer, windows[0]!.payload.byteOffset, 4).getUint32(0)).toBe(4);
+  });
+
+  it('drains independent stream uploads concurrently while preserving each stream order', async () => {
+    const first = new MockConnection();
+    const second = new MockConnection();
+    const connections = [first, second];
+    let releaseFirst!: () => void;
+    let blocked = false;
+    first.write = vi.fn(async (data: Uint8Array) => {
+      first.writes.push(data.slice());
+      if (!blocked) {
+        blocked = true;
+        await new Promise<void>((resolve) => { releaseFirst = resolve; });
+      }
+    });
+    const core = new RelayCore({
+      connector: { open: () => connections.shift()! }, send: vi.fn(), closeCarrier: vi.fn()
+    });
+    const receive = core.receive(new Uint8Array([
+      ...encodeFrame(FrameType.Open, 1),
+      ...encodeFrame(FrameType.Data, 1, new Uint8Array(40 * 1024).fill(1)),
+      ...encodeFrame(FrameType.Data, 1, new Uint8Array(40 * 1024).fill(3)),
+      ...encodeFrame(FrameType.Open, 2), ...encodeFrame(FrameType.Data, 2, Uint8Array.of(2))
+    ]));
+    await settle();
+    expect(second.writes).toEqual([Uint8Array.of(2)]);
+    releaseFirst();
+    await receive;
+    expect(first.writes).toHaveLength(2);
+    expect(first.writes[0]?.every((value) => value === 1)).toBe(true);
+    expect(first.writes[1]?.every((value) => value === 3)).toBe(true);
+  });
+
+  it('encodes downlink from the backend view without an intermediate slice', async () => {
+    const connection = new MockConnection();
+    const core = new RelayCore({ connector: { open: () => connection }, send: vi.fn(), closeCarrier: vi.fn() });
+    await core.receive(encodeFrame(FrameType.Open, 1));
+    const backend = new Uint8Array([1, 2, 3]);
+    const slice = vi.spyOn(Uint8Array.prototype, 'slice');
+    try {
+      connection.emit(backend);
+      await settle();
+      expect(slice).not.toHaveBeenCalled();
+    } finally { slice.mockRestore(); }
+  });
+
+  it('speculates validation state only for streams touched by a batch', async () => {
+    const snapshots: number[] = [];
+    const connection = new MockConnection();
+    const core = new RelayCore({
+      connector: { open: () => connection }, send: vi.fn(), closeCarrier: vi.fn(),
+      onValidationSnapshotCount: (count) => snapshots.push(count)
+    });
+    for (let id = 1; id <= 16; id++) await core.receive(encodeFrame(FrameType.Open, id));
+    snapshots.length = 0;
+    await core.receive(encodeFrame(FrameType.Data, 8, Uint8Array.of(1)));
+    expect(snapshots).toEqual([1]);
   });
 
   it('does not return WINDOW before a deferred write resolves', async () => {

@@ -21,12 +21,13 @@ interface StreamState {
   pendingDownlinkBytes: number;
 }
 
-interface RelayCoreOptions {
+export interface RelayCoreOptions {
   limits?: RelayLimits;
   connector: TelegramConnectorLike;
   send(batch: Uint8Array): void;
   closeCarrier(): void;
   writeTimeoutMs?: number;
+  onValidationSnapshotCount?(count: number): void;
 }
 
 interface Snapshot { receiveCredit: number; sendCredit: number }
@@ -37,7 +38,7 @@ export class RelayCore {
   readonly #streams = new Map<number, StreamState>();
   readonly #closed = new Set<number>();
   readonly #closedOrder: number[] = [];
-  #maxSeenStreamId = 0;
+  #closedStart = 0;
   #pendingBytes = 0;
   #pendingItems = 0;
   #pendingDownlinkBytes = 0;
@@ -63,20 +64,25 @@ export class RelayCore {
   }
 
   #validateAndReserve(frames: Frame[]): { bytes: number; items: number } {
-    const live = new Map<number, Snapshot>();
-    for (const [id, stream] of this.#streams) live.set(id, { receiveCredit: stream.receiveCredit, sendCredit: stream.sendCredit });
+    const touched = new Map<number, Snapshot | null>();
     const closedInBatch = new Set<number>();
-    let maxSeen = this.#maxSeenStreamId;
     let bytes = 0;
     let items = 0;
     for (const frame of frames) {
       if (frame.streamId === 0) continue;
-      const previous = live.get(frame.streamId);
+      let previous: Snapshot | undefined;
+      if (touched.has(frame.streamId)) previous = touched.get(frame.streamId) ?? undefined;
+      else {
+        const stream = this.#streams.get(frame.streamId);
+        if (stream) {
+          previous = { receiveCredit: stream.receiveCredit, sendCredit: stream.sendCredit };
+          touched.set(frame.streamId, previous);
+        }
+      }
       const closed = this.#closed.has(frame.streamId) || closedInBatch.has(frame.streamId);
       if (frame.type === FrameType.Open) {
-        if (previous || closed || frame.streamId <= maxSeen) throw new Error('stream id reuse');
-        maxSeen = frame.streamId;
-        live.set(frame.streamId, { receiveCredit: INITIAL_STREAM_CREDIT, sendCredit: INITIAL_STREAM_CREDIT });
+        if (previous || closed) throw new Error('stream id reuse');
+        touched.set(frame.streamId, { receiveCredit: INITIAL_STREAM_CREDIT, sendCredit: INITIAL_STREAM_CREDIT });
       } else if (frame.type === FrameType.Data) {
         if (closed) continue;
         if (!previous) throw new Error('DATA for unknown stream');
@@ -91,10 +97,11 @@ export class RelayCore {
       } else if (frame.type === FrameType.Close) {
         if (closed) continue;
         if (!previous) throw new Error('CLOSE for unknown stream');
-        live.delete(frame.streamId);
+        touched.set(frame.streamId, null);
         closedInBatch.add(frame.streamId);
       }
     }
+    this.#options.onValidationSnapshotCount?.(touched.size);
     if (this.#pendingBytes + bytes > this.#limits.maxPendingBytes || this.#pendingItems + items > this.#limits.maxPendingItems) {
       throw new Error('pending queue overflow');
     }
@@ -106,7 +113,6 @@ export class RelayCore {
     for (const frame of frames) {
       if (frame.streamId === 0) continue;
       if (frame.type === FrameType.Open) {
-        this.#maxSeenStreamId = frame.streamId;
         if (this.#streams.size >= this.#limits.maxStreams) {
           this.#rememberClosed(frame.streamId);
           this.#options.send(encodeFrame(FrameType.Close, frame.streamId));
@@ -144,24 +150,23 @@ export class RelayCore {
         }
       } else if (frame.type === FrameType.Close) this.#closeStream(frame.streamId, false);
     }
-    for (const [id, collector] of uploads) {
+    await Promise.all(Array.from(uploads, ([id, collector]) => this.#drainUpload(id, collector)));
+  }
+
+  async #drainUpload(id: number, collector: GrainCollector): Promise<void> {
       const stream = this.#streams.get(id);
-      if (!stream) continue;
+      if (!stream) return;
       let drained = 0;
       try {
         for (let grain = collector.take(); grain; grain = collector.take()) {
           await this.#writeWithDeadline(stream.connection, grain);
           drained += grain.byteLength;
         }
-      } catch { this.#closeStream(id, true); continue; }
+      } catch { this.#closeStream(id, true); return; }
       if (drained > 0 && this.#streams.has(id)) {
         stream.receiveCredit += drained;
-        const encoded = encodeFrame(FrameType.Window, id, windowPayload(drained));
-        const output = new Uint8Array(encoded.byteLength);
-        output.set(encoded);
-        this.#options.send(output);
+        this.#options.send(encodeFrame(FrameType.Window, id, windowPayload(drained)));
       }
-    }
   }
 
   async #pumpBackend(id: number, connection: TelegramConnection): Promise<void> {
@@ -188,7 +193,7 @@ export class RelayCore {
             stream.sendCredit,
             this.#limits.maxPendingBytes - this.#pendingDownlinkBytes
           );
-          const payload = value.subarray(offset, offset + length).slice();
+          const payload = value.subarray(offset, offset + length);
           stream.sendCredit -= length;
           stream.pendingDownlinkBytes += length;
           this.#pendingDownlinkBytes += length;
@@ -214,9 +219,15 @@ export class RelayCore {
 
   #rememberClosed(id: number): void {
     if (this.#closed.has(id)) return;
-    if (this.#closedOrder.length >= this.#limits.maxClosedStreamIds) this.#closed.delete(this.#closedOrder.shift()!);
+    if (this.#limits.maxClosedStreamIds === 0) return;
+    if (this.#closedOrder.length >= this.#limits.maxClosedStreamIds) {
+      this.#closed.delete(this.#closedOrder[this.#closedStart]!);
+      this.#closedOrder[this.#closedStart] = id;
+      this.#closedStart = (this.#closedStart + 1) % this.#closedOrder.length;
+    } else {
+      this.#closedOrder.push(id);
+    }
     this.#closed.add(id);
-    this.#closedOrder.push(id);
   }
 
   async #writeWithDeadline(connection: TelegramConnection, grain: Uint8Array): Promise<void> {

@@ -94,6 +94,12 @@ describe('Worker and Durable Object integration', () => {
     expect(new Uint8Array(pong.buffer)).toEqual(encodeFrame(FrameType.Pong, 0, Uint8Array.of(1, 2, 3)));
   });
 
+  it('the bridge transfers a validated no-PING carrier batch only once', async () => {
+    const { response } = await bridge();
+    const html = await response.text();
+    expect(html).toContain('if(!hasPing){port.postMessage({t:\'traffic\',up:0,down:value.byteLength});port.postMessage(value,[value]);return}');
+  });
+
   it('atomically exchanges a bootstrap and returns an idempotent creation result', async () => {
     const { bootstrap } = await bridge();
     const first = await create(bootstrap);

@@ -6,7 +6,7 @@ import { publicResponse } from './public-site';
 import { RelayCore, type TelegramConnectorLike } from './relay-core';
 import { TelegramConnector } from './mtproxy';
 import { CloudflareTelegramDialer } from './tcp';
-import { WebSocketBatcher } from './ws-batcher';
+import { DEFAULT_WEBSOCKET_BATCHER_OPTIONS, WebSocketBatcher } from './ws-batcher';
 import { IdleLiveness, SerializedInboundQueue, readBoundedBody } from './session-guards';
 
 interface BootstrapEntry {
@@ -238,7 +238,7 @@ export class RelaySession {
       server.binaryType = 'arraybuffer';
       this.#socket = server;
       this.#batcher = new WebSocketBatcher((value) => server.send(value), {
-        packBytes: 32 * 1024, directBytes: 32 * 1024, delayMs: 1,
+        ...DEFAULT_WEBSOCKET_BATCHER_OPTIONS,
         maxPendingBytes: DEFAULT_LIMITS.maxPendingBytes, maxPendingItems: DEFAULT_LIMITS.maxPendingItems
       });
       const secret = decodeSecret(this.#env.WEB_SECRET);

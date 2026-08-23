@@ -18,4 +18,13 @@ describe('GrainTCP-derived collector', () => {
     collector.push(chunk);
     expect(collector.take()).toBe(chunk);
   });
+
+  it('keeps backing storage bounded across long FIFO drains', () => {
+    const collector = new GrainCollector(1);
+    for (let index = 0; index < 10_000; index++) {
+      collector.push(Uint8Array.of(index));
+      expect(collector.take()).toEqual(Uint8Array.of(index));
+    }
+    expect(collector.retainedItems).toBeLessThan(1024);
+  });
 });

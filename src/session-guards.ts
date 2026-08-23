@@ -9,7 +9,8 @@ interface QueueOptions<T> {
 
 export class SerializedInboundQueue<T> {
   readonly #options: QueueOptions<T>;
-  readonly #values: Array<{ value: T; bytes: number }> = [];
+  #values: Array<{ value: T; bytes: number } | undefined> = [];
+  #head = 0;
   #running = false;
   #pendingBytes = 0;
   #drainWaiters: Array<() => void> = [];
@@ -17,7 +18,8 @@ export class SerializedInboundQueue<T> {
 
   constructor(options: QueueOptions<T>) { this.#options = options; }
   get pendingBytes(): number { return this.#pendingBytes; }
-  get pendingItems(): number { return this.#values.length + (this.#running ? 1 : 0); }
+  get pendingItems(): number { return this.#values.length - this.#head + (this.#running ? 1 : 0); }
+  get retainedItems(): number { return this.#values.length; }
 
   push(value: T): boolean {
     if (this.#failed) return false;
@@ -30,7 +32,7 @@ export class SerializedInboundQueue<T> {
   }
 
   async drained(): Promise<void> {
-    if (!this.#running && this.#values.length === 0) {
+    if (!this.#running && this.#head === this.#values.length) {
       if (this.#failed) throw this.#failed;
       return;
     }
@@ -39,7 +41,11 @@ export class SerializedInboundQueue<T> {
   }
 
   clear(): void {
-    for (const item of this.#values.splice(0)) this.#pendingBytes -= item.bytes;
+    for (; this.#head < this.#values.length; this.#head++) {
+      const item = this.#values[this.#head];
+      if (item) this.#pendingBytes -= item.bytes;
+    }
+    this.#compact();
     this.#finishDrain();
   }
 
@@ -47,10 +53,12 @@ export class SerializedInboundQueue<T> {
     if (this.#running) return;
     this.#running = true;
     try {
-      for (let item = this.#values.shift(); item; item = this.#values.shift()) {
+      while (this.#head < this.#values.length) {
+        const item = this.#values[this.#head]!;
+        this.#values[this.#head++] = undefined;
         try { await this.#options.handle(item.value); }
         catch (error) { this.#failed = error; this.clear(); break; }
-        finally { this.#pendingBytes -= item.bytes; }
+        finally { this.#pendingBytes -= item.bytes; this.#compact(); }
       }
     } finally {
       this.#running = false;
@@ -59,8 +67,18 @@ export class SerializedInboundQueue<T> {
   }
 
   #finishDrain(): void {
-    if (this.#running || this.#values.length) return;
+    if (this.#running || this.#head !== this.#values.length) return;
     for (const resolve of this.#drainWaiters.splice(0)) resolve();
+  }
+
+  #compact(): void {
+    if (this.#head === this.#values.length) {
+      this.#values = [];
+      this.#head = 0;
+    } else if (this.#head >= 1024 && this.#head * 2 >= this.#values.length) {
+      this.#values = this.#values.slice(this.#head);
+      this.#head = 0;
+    }
   }
 }
 

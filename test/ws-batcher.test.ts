@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { WebSocketBatcher } from '../src/ws-batcher';
+import { DEFAULT_WEBSOCKET_BATCHER_OPTIONS, WebSocketBatcher } from '../src/ws-batcher';
 
 describe('small downlink aggregation and large direct send', () => {
   it('gates small chunks into one send and sends large chunks directly', async () => {
@@ -17,5 +17,27 @@ describe('small downlink aggregation and large direct send', () => {
     expect(output.at(-1)).toBe(large);
     expect(output.at(-2)).toEqual(new Uint8Array([5]));
     vi.useRealTimers();
+  });
+
+  it('packs ordinary 64 KiB DATA frames under the production profile', async () => {
+    vi.useFakeTimers();
+    try {
+      const output: Uint8Array[] = [];
+      const batcher = new WebSocketBatcher((value) => output.push(value), DEFAULT_WEBSOCKET_BATCHER_OPTIONS);
+      for (let index = 0; index < 7; index++) batcher.send(new Uint8Array(64 * 1024 + 8));
+      expect(output).toHaveLength(0);
+      await vi.advanceTimersByTimeAsync(DEFAULT_WEBSOCKET_BATCHER_OPTIONS.delayMs);
+      expect(output).toHaveLength(1);
+      expect(output[0]?.byteLength).toBe(7 * (64 * 1024 + 8));
+    } finally { vi.useRealTimers(); }
+  });
+
+  it('flushes before pack overflow instead of emitting an avoidable tail message', () => {
+    const output: Uint8Array[] = [];
+    const batcher = new WebSocketBatcher((value) => output.push(value), DEFAULT_WEBSOCKET_BATCHER_OPTIONS);
+    for (let index = 0; index < 32; index++) batcher.send(new Uint8Array(64 * 1024 + 8));
+    batcher.flush();
+    expect(output).toHaveLength(5);
+    expect(output.every((value) => value.byteLength <= DEFAULT_WEBSOCKET_BATCHER_OPTIONS.packBytes)).toBe(true);
   });
 });

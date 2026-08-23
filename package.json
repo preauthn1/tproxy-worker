@@ -8,6 +8,7 @@
     "test": "vitest run",
     "typecheck": "tsc --noEmit",
     "lint": "eslint .",
+    "bench": "tsx scripts/bench.ts",
     "capability": "tsx scripts/capability.ts",
     "web-secret": "tsx scripts/web-secret.ts",
     "smoke": "tsx scripts/smoke.ts"

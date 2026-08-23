@@ -13,6 +13,12 @@ interface BatcherOptions {
   maxPendingItems?: number;
 }
 
+export const DEFAULT_WEBSOCKET_BATCHER_OPTIONS: Readonly<BatcherOptions> = Object.freeze({
+  packBytes: 512 * 1024,
+  directBytes: 1024 * 1024,
+  delayMs: 1
+});
+
 /** GrainTCP-derived small-downlink grain core with a short flush gate. */
 export class WebSocketBatcher {
   readonly #emit: (value: Uint8Array) => void;
@@ -41,6 +47,7 @@ export class WebSocketBatcher {
     if (this.#collector.bytes + value.byteLength > this.#options.maxPendingBytes || this.#items >= this.#options.maxPendingItems) {
       throw new Error('downlink queue overflow');
     }
+    if (!this.#collector.empty && this.#collector.bytes + value.byteLength > this.#options.packBytes) this.flush();
     this.#collector.push(value);
     this.#items++;
     if (this.#collector.bytes >= this.#options.packBytes) this.flush();

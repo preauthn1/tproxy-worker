@@ -11,7 +11,7 @@ export enum FrameType {
 
 export interface Frame { type: FrameType; streamId: number; payload: Uint8Array }
 
-export function encodeFrame(type: FrameType, streamId: number, payload = new Uint8Array()): Uint8Array {
+export function encodeFrame(type: FrameType, streamId: number, payload: Uint8Array<ArrayBufferLike> = new Uint8Array()): Uint8Array<ArrayBuffer> {
   if (!Number.isInteger(streamId) || streamId < 0 || streamId > 0xffffff) throw new Error('stream id exceeds 24 bits');
   if (payload.byteLength > MAX_FRAME_PAYLOAD) throw new Error('frame payload exceeds limit');
   const result = new Uint8Array(FRAME_HEADER_BYTES + payload.byteLength);

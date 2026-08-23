@@ -6,7 +6,8 @@
 /** A bounded small-chunk collector adapted from GrainTCP's mkK/mkQ grain core. */
 export class GrainCollector {
   readonly #capacity: number;
-  #queue: Uint8Array[] = [];
+  #queue: Array<Uint8Array | undefined> = [];
+  #head = 0;
   #bytes = 0;
 
   constructor(capacity: number) {
@@ -15,7 +16,8 @@ export class GrainCollector {
   }
 
   get bytes(): number { return this.#bytes; }
-  get empty(): boolean { return this.#queue.length === 0; }
+  get empty(): boolean { return this.#head === this.#queue.length; }
+  get retainedItems(): number { return this.#queue.length; }
 
   push(value: Uint8Array): void {
     if (value.byteLength === 0) return;
@@ -24,27 +26,44 @@ export class GrainCollector {
   }
 
   take(): Uint8Array | null {
-    const first = this.#queue.shift();
+    const first = this.#queue[this.#head];
     if (!first) return null;
+    this.#queue[this.#head++] = undefined;
     this.#bytes -= first.byteLength;
-    if (first.byteLength >= this.#capacity || this.#queue.length === 0) return first;
+    if (first.byteLength >= this.#capacity || this.#head === this.#queue.length) {
+      this.#compact();
+      return first;
+    }
     let total = first.byteLength;
     let count = 0;
-    while (count < this.#queue.length && total + this.#queue[count]!.byteLength <= this.#capacity) {
-      total += this.#queue[count]!.byteLength;
+    while (this.#head + count < this.#queue.length && total + this.#queue[this.#head + count]!.byteLength <= this.#capacity) {
+      total += this.#queue[this.#head + count]!.byteLength;
       count++;
     }
-    if (count === 0) return first;
+    if (count === 0) { this.#compact(); return first; }
     const result = new Uint8Array(total);
     result.set(first);
     let offset = first.byteLength;
-    for (const value of this.#queue.splice(0, count)) {
+    for (let index = 0; index < count; index++) {
+      const value = this.#queue[this.#head]!;
+      this.#queue[this.#head++] = undefined;
       result.set(value, offset);
       offset += value.byteLength;
       this.#bytes -= value.byteLength;
     }
+    this.#compact();
     return result;
   }
 
-  clear(): void { this.#queue = []; this.#bytes = 0; }
+  clear(): void { this.#queue = []; this.#head = 0; this.#bytes = 0; }
+
+  #compact(): void {
+    if (this.#head === this.#queue.length) {
+      this.#queue = [];
+      this.#head = 0;
+    } else if (this.#head >= 1024 && this.#head * 2 >= this.#queue.length) {
+      this.#queue = this.#queue.slice(this.#head);
+      this.#head = 0;
+    }
+  }
 }

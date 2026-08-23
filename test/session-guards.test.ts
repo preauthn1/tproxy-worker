@@ -31,6 +31,17 @@ describe('session resource guards', () => {
     expect(queue.push(2)).toBe(false);
   });
 
+  it('keeps backing storage bounded across long drains', async () => {
+    const queue = new SerializedInboundQueue<number>({
+      maxBytes: 16, maxItems: 16, size: () => 1, handle: async () => undefined
+    });
+    for (let index = 0; index < 10_000; index++) {
+      expect(queue.push(index)).toBe(true);
+      await queue.drained();
+    }
+    expect(queue.retainedItems).toBeLessThan(1024);
+  });
+
   it('reads at most limit+1 bytes and cancels an oversized create body', async () => {
     let cancelled = false;
     const body = new ReadableStream<Uint8Array>({
