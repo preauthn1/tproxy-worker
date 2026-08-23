@@ -1,0 +1,22 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "tproxy-worker",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-08-22",
+  "durable_objects": {
+    "bindings": [
+      { "name": "BOOTSTRAPS", "class_name": "BootstrapRegistry" },
+      { "name": "SESSIONS", "class_name": "RelaySession" }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["BootstrapRegistry", "RelaySession"]
+    }
+  ],
+  "vars": {
+    "PUBLIC_SITE_TITLE": "Public Site"
+  },
+  "observability": { "enabled": true }
+}

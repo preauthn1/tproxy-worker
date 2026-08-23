@@ -1,0 +1,31 @@
+import { base64Url } from './capability';
+
+const PERMISSIONS_POLICY = 'accelerometer=(), autoplay=(), camera=(), clipboard-read=(), clipboard-write=(), display-capture=(), encrypted-media=(), fullscreen=(), geolocation=(), gyroscope=(), hid=(), idle-detection=(), magnetometer=(), microphone=(), midi=(), payment=(), picture-in-picture=(), publickey-credentials-create=(), publickey-credentials-get=(), screen-wake-lock=(), serial=(), usb=(), web-share=(), xr-spatial-tracking=()';
+
+export function bridgeResponse(hostname: string, bootstrapToken: string): Response {
+  const nonce = base64Url(crypto.getRandomValues(new Uint8Array(18)));
+  const origin = `https://${hostname}`;
+  const body = `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Connection</title></head><body><script nonce="${nonce}">
+(()=>{'use strict';const relayOrigin=${JSON.stringify(origin)};const bootstrap=${JSON.stringify(bootstrapToken)};const carrierMode="websocket";
+const fragment=location.hash,androidNonce=/^#android=([A-Za-z0-9_-]{43})$/.exec(fragment)?.[1]||'';history.replaceState(null,'',location.pathname);
+let initialized=false,closed=false,port=null,sessionToken='',socket=null,creating=false;const queued=[];let queuedBytes=0;const queueLimit=33554432;
+function splitFrames(value){const view=new DataView(value);let offset=0,result=[];while(offset<value.byteLength){if(value.byteLength-offset<8||result.length>=4096)throw 0;const size=view.getUint32(offset+4),end=offset+8+size;if(size>1048576||end>value.byteLength)throw 0;result.push(value.slice(offset,end));offset=end}if(!result.length)throw 0;return result}
+const status=state=>{if(port&&!closed)port.postMessage({t:'status',state})};
+const opts=(method,token,body,keepalive=false)=>({method,body,keepalive,mode:'same-origin',credentials:'omit',cache:'no-store',redirect:'error',referrerPolicy:'no-referrer',headers:Object.assign(token?{Authorization:'Bearer '+token}:{},body?{'Content-Type':'application/octet-stream'}:{})});
+function fail(){if(closed)return;status('failed');if(port)port.postMessage({t:'close'});shutdown(true)}
+function send(value){if(socket&&socket.readyState===WebSocket.OPEN){if(socket.bufferedAmount+value.byteLength>queueLimit)return fail();socket.send(value);port.postMessage({t:'traffic',up:value.byteLength,down:0});return}if(queuedBytes+value.byteLength>queueLimit)return fail();queued.push(value);queuedBytes+=value.byteLength}
+async function create(first){try{status('connecting');const response=await fetch(relayOrigin+'/api/v1/session',opts('POST',bootstrap,first));if(response.status!==200||response.headers.get('X-Carrier-Mode')!==carrierMode)throw 0;sessionToken=response.headers.get('X-Session-Token')||'';if(!sessionToken)throw 0;const welcome=await response.arrayBuffer();socket=new WebSocket(relayOrigin.replace(/^https:/,'wss:')+'/api/v1/ws','tproxy-v1.'+sessionToken);socket.binaryType='arraybuffer';socket.onmessage=event=>{if(!(event.data instanceof ArrayBuffer)||!event.data.byteLength)return fail();port.postMessage({t:'traffic',up:0,down:event.data.byteLength});port.postMessage(event.data,[event.data])};socket.onclose=()=>{if(!closed)fail()};socket.onerror=()=>{};socket.onopen=()=>{if(closed)return socket.close();port.postMessage(welcome,[welcome]);status('connected');for(const value of queued.splice(0)){queuedBytes-=value.byteLength;send(value)}}}catch{fail()}}
+function shutdown(notify){if(closed)return;closed=true;if(socket)try{socket.close()}catch{};if(notify&&sessionToken)fetch(relayOrigin+'/api/v1/session',opts('DELETE',sessionToken,null,true)).catch(()=>{});if(port)port.close()}
+function activate(next){initialized=true;port=next;port.onmessage=event=>{const value=event.data;if(value instanceof ArrayBuffer){if(!creating){creating=true;create(value)}else send(value)}else if(value&&value.t==='close')shutdown(true)};port.start();status('connecting')}
+addEventListener('message',event=>{if(initialized||event.source!==parent||!event.data||typeof event.data!=='object'||event.data.t!=='tproxy-init'||event.data.v!==1||event.ports.length!==1)return;let source;try{source=new URL(event.origin)}catch{return}if(source.protocol!=='http:'||source.hostname!=='127.0.0.1'||!source.port||source.origin!==event.origin)return;activate(event.ports[0])});
+const native=globalThis.TelegramWebProxy;if(!initialized&&androidNonce&&native&&typeof native.postMessage==='function'){const direct={onmessage:null,start(){},close(){native.onmessage=null},postMessage(value){if(value instanceof ArrayBuffer){try{for(const frame of splitFrames(value))native.postMessage(frame)}catch{return fail()}}else native.postMessage(JSON.stringify(value))}};native.onmessage=event=>{let data=event.data;if(typeof data==='string'){try{data=JSON.parse(data)}catch{return}}if(direct.onmessage)direct.onmessage({data})};activate(direct);native.postMessage(JSON.stringify({t:'tproxy-android-init',v:1,nonce:androidNonce}))}
+addEventListener('pagehide',()=>shutdown(true),{once:true});})();
+</script></body></html>`;
+  return new Response(body, {
+    headers: {
+      'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store', 'Referrer-Policy': 'no-referrer',
+      'X-Content-Type-Options': 'nosniff', 'X-DNS-Prefetch-Control': 'off', 'Permissions-Policy': PERMISSIONS_POLICY,
+      'Content-Security-Policy': `default-src 'none'; base-uri 'none'; child-src 'none'; connect-src 'self' wss://${hostname}; font-src 'none'; form-action 'none'; frame-ancestors http://127.0.0.1:*; frame-src 'none'; img-src 'none'; manifest-src 'none'; media-src 'none'; object-src 'none'; script-src 'nonce-${nonce}'; style-src 'none'; worker-src 'none'; sandbox allow-same-origin allow-scripts`
+    }
+  });
+}

@@ -1,0 +1,26 @@
+{
+  "name": "tproxy-worker",
+  "version": "0.1.0",
+  "private": true,
+  "license": "GPL-3.0-only",
+  "type": "module",
+  "scripts": {
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint .",
+    "capability": "tsx scripts/capability.ts",
+    "smoke": "tsx scripts/smoke.ts"
+  },
+  "devDependencies": {
+    "@cloudflare/vitest-pool-workers": "0.22.0",
+    "@cloudflare/workers-types": "5.20260823.1",
+    "@eslint/js": "9.34.0",
+    "@types/node": "24.3.0",
+    "eslint": "9.34.0",
+    "tsx": "4.20.5",
+    "typescript": "5.9.2",
+    "typescript-eslint": "8.40.0",
+    "vitest": "4.1.11",
+    "wrangler": "4.125.0"
+  }
+}
