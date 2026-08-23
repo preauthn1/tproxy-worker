@@ -59,9 +59,10 @@ The repository started clean at commit `472ab5d18dde6936db2a670632678448762e0a4e
    queues, applies `OPEN`/`WINDOW`/`CLOSE`, and returns without awaiting a backend
    write. Preserve exact same-stream order across carrier messages. A close drops
    queued byte/item charges and identity-checks prevent a stale completion from
-   mutating a reused stream. The Durable Object adapter registers the long-lived
-   backend pumps with `state.waitUntil`; the relay itself stays on the standard
-   non-hibernating WebSocket API because its live TCP/cipher state is in memory.
+   mutating a reused stream. The relay stays on the standard non-hibernating
+   WebSocket API because its live TCP/cipher state is in memory; Durable Object
+   `waitUntil()` is not used as a lifetime mechanism because it has no effect in
+   Durable Objects.
 6. Return receive credit only for successful backend writes. Coalesce it per
    stream at 256 KiB or 20 ms, cancel it on stream/session close, and split only
    above the `uint32` frame limit.

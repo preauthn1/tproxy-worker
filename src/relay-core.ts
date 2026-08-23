@@ -40,7 +40,6 @@ export interface RelayCoreOptions {
   send(batch: Uint8Array, control?: boolean): void;
   closeCarrier(): void;
   writeTimeoutMs?: number;
-  defer?(task: Promise<void>): void;
   onValidationSnapshotCount?(count: number): void;
 }
 
@@ -352,8 +351,7 @@ export class RelayCore {
   #sendControl(frame: Uint8Array): void { this.#options.send(frame, true); }
 
   #background(task: Promise<void>): void {
-    if (this.#options.defer) this.#options.defer(task);
-    else void task;
+    void task;
   }
 
   #releasePending(bytes: number, items: number): void {

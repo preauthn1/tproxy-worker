@@ -250,8 +250,7 @@ export class RelaySession {
             try { this.#batcher?.send(batch, control); }
             catch { void this.#close(); }
           },
-          closeCarrier: () => { void this.#close(); },
-          defer: (task) => this.#state.waitUntil(task)
+          closeCarrier: () => { void this.#close(); }
         });
       } finally { secret.fill(0); }
       this.#queue = new SerializedInboundQueue({

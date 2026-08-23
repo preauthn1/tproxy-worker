@@ -211,18 +211,6 @@ describe('relay session state and flow control', () => {
     core.close();
   });
 
-  it('registers long-lived backend tasks with the runtime adapter', async () => {
-    const deferred: Promise<void>[] = [];
-    const connection = new MockConnection();
-    const core = new RelayCore({
-      connector: { open: () => connection }, send: vi.fn(), closeCarrier: vi.fn(),
-      defer: (task) => deferred.push(task)
-    });
-    await core.receive(encodeFrame(FrameType.Open, 1));
-    expect(deferred).toHaveLength(1);
-    core.close();
-    await Promise.all(deferred);
-  });
 
   it('yields after a bounded writer turn when writes resolve immediately', async () => {
     const { core, connection } = fixture();
