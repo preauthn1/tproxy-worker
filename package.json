@@ -9,6 +9,7 @@
     "typecheck": "tsc --noEmit",
     "lint": "eslint .",
     "capability": "tsx scripts/capability.ts",
+    "web-secret": "tsx scripts/web-secret.ts",
     "smoke": "tsx scripts/smoke.ts"
   },
   "devDependencies": {

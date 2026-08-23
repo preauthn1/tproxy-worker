@@ -61,6 +61,17 @@ describe('Worker and Durable Object integration', () => {
     }
   });
 
+  it('uses the stock nginx welcome page as the public camouflage', async () => {
+    const response = await SELF.fetch('https://proxy.example.com/');
+    expect(response.status).toBe(200);
+    expect(response.headers.get('Server')).toBe('nginx');
+    const html = await response.text();
+    expect(html).toContain('<title>Welcome to nginx!</title>');
+    expect(html).toContain('<h1>Welcome to nginx!</h1>');
+    expect(html).toContain('Thank you for using nginx.');
+    expect(html).not.toContain('Public Site');
+  });
+
   it('renders only the exact capability bridge as dynamic no-store websocket page', async () => {
     const { response } = await bridge();
     expect(response.status).toBe(200);

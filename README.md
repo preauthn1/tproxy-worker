@@ -68,6 +68,30 @@ Vitest 使用 `@cloudflare/vitest-pool-workers` 执行 Worker/Durable Object int
 
 不存在可配置的 backend hostname 或 backend port。目标仅来自校验后的 Telegram DC id 和代码内 allowlist。
 
+### 优选 Cloudflare 边缘连接
+
+定制客户端可以使用 `web1.` 连接 secret，将三项客户端连接信息放在一个可移植字符串中：
+
+- 原始 16-byte 或 `dd` + 16-byte MTProxy secret；
+- 必须保持不变的 TLS SNI / HTTP Host：例如 `proxy.example.com`；
+- 优选连接地址：Cloudflare 优选域名或公网 IPv4。
+
+生成命令：
+
+```bash
+npm run web-secret -- proxy.example.com <优选域名或公网IP> <MTProxy-secret>
+```
+
+这是**定制 WEB adapter 配置**，不是传给 Worker 的 MTProxy secret。Native adapter 必须：
+
+1. TCP 连接优选地址的 `443`；
+2. TLS SNI 仍使用 `proxy.example.com`，并正常验证该主机证书；
+3. HTTP `Host` / HTTP/2 `:authority` 仍为 `proxy.example.com`；
+4. Bridge/WSS URL 的逻辑 origin 仍为 `https://proxy.example.com`；
+5. 仅将 envelope 内的原始 MTProxy secret 用于 obfuscated2 和 capability 派生。
+
+浏览器原生 `fetch()` / `WebSocket` 无法指定“连接优选地址，但使用另一 SNI/Host”；此功能必须由定制客户端 native 网络层实现。不要关闭 TLS 证书验证，也不要把 Host 改成优选域名。
+
 本地 `.dev.vars` 示例使用明显占位符，必须替换且不能提交：
 
 ```dotenv
