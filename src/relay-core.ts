@@ -2,16 +2,19 @@ import { FrameType, INITIAL_STREAM_CREDIT, RELAY_DATA_CHUNK, encodeFrame, parseC
 import { GrainCollector } from './grain';
 import { DEFAULT_LIMITS, QUEUE_ITEM_COST, type RelayLimits } from './limits';
 
-export interface BackendConnection {
+export interface TelegramConnection {
   write(data: Uint8Array): Promise<void>;
   read(): AsyncIterable<Uint8Array>;
   close(): void;
 }
 
-export interface BackendConnector { connect(hostname: string, port: number): Promise<BackendConnection> }
+export interface TelegramConnectorLike {
+  open(): TelegramConnection;
+  close?(): void;
+}
 
 interface StreamState {
-  connection: BackendConnection;
+  connection: TelegramConnection;
   receiveCredit: number;
   sendCredit: number;
   creditWaiters: Array<() => void>;
@@ -19,12 +22,11 @@ interface StreamState {
 }
 
 interface RelayCoreOptions {
-  backendHost: string;
-  backendPort: number;
   limits?: RelayLimits;
-  connector: BackendConnector;
+  connector: TelegramConnectorLike;
   send(batch: Uint8Array): void;
   closeCarrier(): void;
+  writeTimeoutMs?: number;
 }
 
 interface Snapshot { receiveCredit: number; sendCredit: number }
@@ -35,6 +37,7 @@ export class RelayCore {
   readonly #streams = new Map<number, StreamState>();
   readonly #closed = new Set<number>();
   readonly #closedOrder: number[] = [];
+  #maxSeenStreamId = 0;
   #pendingBytes = 0;
   #pendingItems = 0;
   #pendingDownlinkBytes = 0;
@@ -63,6 +66,7 @@ export class RelayCore {
     const live = new Map<number, Snapshot>();
     for (const [id, stream] of this.#streams) live.set(id, { receiveCredit: stream.receiveCredit, sendCredit: stream.sendCredit });
     const closedInBatch = new Set<number>();
+    let maxSeen = this.#maxSeenStreamId;
     let bytes = 0;
     let items = 0;
     for (const frame of frames) {
@@ -70,7 +74,8 @@ export class RelayCore {
       const previous = live.get(frame.streamId);
       const closed = this.#closed.has(frame.streamId) || closedInBatch.has(frame.streamId);
       if (frame.type === FrameType.Open) {
-        if (previous || closed) throw new Error('stream id reuse');
+        if (previous || closed || frame.streamId <= maxSeen) throw new Error('stream id reuse');
+        maxSeen = frame.streamId;
         live.set(frame.streamId, { receiveCredit: INITIAL_STREAM_CREDIT, sendCredit: INITIAL_STREAM_CREDIT });
       } else if (frame.type === FrameType.Data) {
         if (closed) continue;
@@ -101,13 +106,14 @@ export class RelayCore {
     for (const frame of frames) {
       if (frame.streamId === 0) continue;
       if (frame.type === FrameType.Open) {
+        this.#maxSeenStreamId = frame.streamId;
         if (this.#streams.size >= this.#limits.maxStreams) {
           this.#rememberClosed(frame.streamId);
           this.#options.send(encodeFrame(FrameType.Close, frame.streamId));
           continue;
         }
-        let connection: BackendConnection;
-        try { connection = await this.#options.connector.connect(this.#options.backendHost, this.#options.backendPort); }
+        let connection: TelegramConnection;
+        try { connection = this.#options.connector.open(); }
         catch {
           this.#rememberClosed(frame.streamId);
           this.#options.send(encodeFrame(FrameType.Close, frame.streamId));
@@ -144,7 +150,7 @@ export class RelayCore {
       let drained = 0;
       try {
         for (let grain = collector.take(); grain; grain = collector.take()) {
-          await stream.connection.write(grain);
+          await this.#writeWithDeadline(stream.connection, grain);
           drained += grain.byteLength;
         }
       } catch { this.#closeStream(id, true); continue; }
@@ -158,7 +164,7 @@ export class RelayCore {
     }
   }
 
-  async #pumpBackend(id: number, connection: BackendConnection): Promise<void> {
+  async #pumpBackend(id: number, connection: TelegramConnection): Promise<void> {
     try {
       for await (const value of connection.read()) {
         if (this.#ended || this.#streams.get(id)?.connection !== connection) return;
@@ -213,6 +219,25 @@ export class RelayCore {
     this.#closedOrder.push(id);
   }
 
+  async #writeWithDeadline(connection: TelegramConnection, grain: Uint8Array): Promise<void> {
+    const timeoutMs = this.#options.writeTimeoutMs ?? 30_000;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await Promise.race([
+        connection.write(grain),
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(() => reject(new Error('Telegram write deadline exceeded')), timeoutMs);
+        })
+      ]);
+    } catch (error) {
+      if (error instanceof Error && /deadline/.test(error.message)) {
+        this.close();
+        this.#options.closeCarrier();
+      }
+      throw error;
+    } finally { if (timer) clearTimeout(timer); }
+  }
+
   close(): void {
     if (this.#ended) return;
     this.#ended = true;
@@ -221,6 +246,7 @@ export class RelayCore {
       for (const wake of stream.creditWaiters.splice(0)) wake();
     }
     this.#streams.clear();
+    this.#options.connector.close?.();
     this.#pendingDownlinkBytes = 0;
     for (const wake of this.#downlinkWaiters.splice(0)) wake();
   }

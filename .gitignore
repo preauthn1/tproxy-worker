@@ -7,5 +7,6 @@ coverage/
 .env*
 !.env.example
 .codex-result.md
+.codex-*.md
 .deploy-secret
 scripts/live-smoke-local.sh

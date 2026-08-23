@@ -3,9 +3,11 @@ import { decodeSecret, deriveCapability, randomToken, validateHostname, validTok
 import { FrameType, encodeFrame, parseHello } from './frame';
 import { DEFAULT_LIMITS } from './limits';
 import { publicResponse } from './public-site';
-import { RelayCore } from './relay-core';
-import { CloudflareSocketConnector } from './tcp';
+import { RelayCore, type TelegramConnectorLike } from './relay-core';
+import { TelegramConnector } from './mtproxy';
+import { CloudflareTelegramDialer } from './tcp';
 import { WebSocketBatcher } from './ws-batcher';
+import { IdleLiveness, SerializedInboundQueue, readBoundedBody } from './session-guards';
 
 interface BootstrapEntry {
   expiresAt: number;
@@ -17,15 +19,27 @@ interface BootstrapEntry {
 
 interface SessionConfig {
   token: string;
-  backendHost: string;
-  backendPort: number;
   clientIp: string;
-  closed: boolean;
+  expiresAt: number;
 }
 
 const INTERNAL_AUTH = 'X-Tproxy-Internal-Token';
 const BOOTSTRAP_TTL_MS = 2 * 60 * 1000;
+const SESSION_TTL_MS = 6 * 60 * 60 * 1000;
 const CREATE_BODY_LIMIT = 64;
+const CREATE_BODY_DEADLINE_MS = 10_000;
+const MAX_BOOTSTRAPS = 512;
+const BOOTSTRAP_RATE_WINDOW_MS = 60_000;
+const BOOTSTRAP_RATE_BURST = 256;
+const IDLE_PERIOD_MS = 75_000;
+
+type ConnectorFactory = (secret: Uint8Array) => TelegramConnectorLike;
+const connectorFactories = new WeakMap<RelaySession, ConnectorFactory>();
+
+/** Internal test seam: the factory is attached to an in-process DO instance, never to a request. */
+export function installRelaySessionTestFactory(instance: RelaySession, factory: ConnectorFactory): void {
+  connectorFactories.set(instance, factory);
+}
 
 function title(env: Env): string { return env.PUBLIC_SITE_TITLE || 'Public Site'; }
 function hidden(env: Env): Response { return publicResponse(title(env), 404); }
@@ -50,25 +64,33 @@ async function sha256Base64(bytes: Uint8Array): Promise<string> {
   return btoa(binary);
 }
 
+function constantTimeEqual(left: string, right: string): boolean {
+  const a = new TextEncoder().encode(left);
+  const b = new TextEncoder().encode(right);
+  let difference = a.byteLength ^ b.byteLength;
+  const length = Math.max(a.byteLength, b.byteLength);
+  for (let index = 0; index < length; index++) difference |= (a[index] ?? 0) ^ (b[index] ?? 0);
+  return difference === 0;
+}
+
 export class BootstrapRegistry {
   readonly #state: DurableObjectState;
   readonly #env: Env;
-  #createTail: Promise<void> = Promise.resolve();
+  readonly #createTails = new Map<string, Promise<void>>();
+  #issueTail: Promise<void> = Promise.resolve();
 
   constructor(state: DurableObjectState, env: Env) { this.#state = state; this.#env = env; }
 
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
+    const token = request.headers.get(INTERNAL_AUTH) || '';
+    if (!validToken(token)) return new Response(null, { status: 404 });
     if (url.pathname === '/reset' && request.method === 'POST') {
       await this.#state.storage.deleteAll();
       return new Response(null, { status: 204 });
     }
-    const token = request.headers.get(INTERNAL_AUTH) || '';
-    if (!validToken(token)) return new Response(null, { status: 404 });
     if (url.pathname === '/issue' && request.method === 'POST') {
-      const entry: BootstrapEntry = { expiresAt: Date.now() + BOOTSTRAP_TTL_MS, issuanceIp: request.headers.get('X-Client-IP') || '', used: false };
-      await this.#state.storage.put(`bootstrap:${token}`, entry);
-      return new Response(null, { status: 204 });
+      return this.#serializeIssue(() => this.#issue(token, request.headers.get('X-Client-IP') || ''));
     }
     const key = `bootstrap:${token}`;
     const entry = await this.#state.storage.get<BootstrapEntry>(key);
@@ -77,14 +99,57 @@ export class BootstrapRegistry {
       return new Response(null, { status: 404 });
     }
     if (url.pathname === '/lookup' && request.method === 'POST') return new Response(null, { status: 204 });
-    if (url.pathname === '/create' && request.method === 'POST') return this.#serializeCreate(() => this.#create(token, key, request));
+    if (url.pathname === '/create' && request.method === 'POST') return this.#serializeCreate(token, () => this.#create(token, key, request));
     return new Response(null, { status: 404 });
   }
 
-  #serializeCreate(task: () => Promise<Response>): Promise<Response> {
-    const result = this.#createTail.then(task, task);
-    this.#createTail = result.then(() => undefined, () => undefined);
+  #serializeCreate(token: string, task: () => Promise<Response>): Promise<Response> {
+    const previous = this.#createTails.get(token) ?? Promise.resolve();
+    const result = previous.then(task, task);
+    const tail = result.then(() => undefined, () => undefined);
+    this.#createTails.set(token, tail);
+    void tail.finally(() => { if (this.#createTails.get(token) === tail) this.#createTails.delete(token); });
     return result;
+  }
+
+  #serializeIssue(task: () => Promise<Response>): Promise<Response> {
+    const result = this.#issueTail.then(task, task);
+    this.#issueTail = result.then(() => undefined, () => undefined);
+    return result;
+  }
+
+  async #issue(token: string, issuanceIp: string): Promise<Response> {
+    const now = Date.now();
+    const rate = await this.#state.storage.get<{ start: number; count: number }>('bootstrap-rate') ?? { start: now, count: 0 };
+    if (now - rate.start >= BOOTSTRAP_RATE_WINDOW_MS) { rate.start = now; rate.count = 0; }
+    const active = await this.#activeBootstraps(now);
+    if (active.length >= MAX_BOOTSTRAPS || rate.count >= BOOTSTRAP_RATE_BURST) return new Response(null, { status: 429, headers: { 'Retry-After': '1' } });
+    const entry: BootstrapEntry = { expiresAt: now + BOOTSTRAP_TTL_MS, issuanceIp, used: false };
+    rate.count++;
+    await this.#state.storage.put({ [`bootstrap:${token}`]: entry, 'bootstrap-rate': rate });
+    await this.#scheduleAlarm(active.map(([, value]) => value.expiresAt).concat(entry.expiresAt));
+    return new Response(null, { status: 204 });
+  }
+
+  async #activeBootstraps(now: number): Promise<Array<[string, BootstrapEntry]>> {
+    const listed = await this.#state.storage.list<BootstrapEntry>({ prefix: 'bootstrap:' });
+    const active: Array<[string, BootstrapEntry]> = [];
+    const expired: string[] = [];
+    for (const [key, value] of listed) {
+      if (value.expiresAt <= now) expired.push(key);
+      else active.push([key, value]);
+    }
+    if (expired.length) await this.#state.storage.delete(expired);
+    return active;
+  }
+
+  async #scheduleAlarm(expiries: number[]): Promise<void> {
+    if (expiries.length) await this.#state.storage.setAlarm(Math.min(...expiries));
+  }
+
+  async alarm(): Promise<void> {
+    const active = await this.#activeBootstraps(Date.now());
+    if (active.length) await this.#scheduleAlarm(active.map(([, value]) => value.expiresAt));
   }
 
   async #create(token: string, key: string, request: Request): Promise<Response> {
@@ -93,7 +158,7 @@ export class BootstrapRegistry {
         if (entry) await this.#state.storage.delete(key);
         return new Response(null, { status: 404 });
       }
-      const body = new Uint8Array(await request.arrayBuffer());
+      const body = await readBoundedBody(request.body, CREATE_BODY_LIMIT, CREATE_BODY_DEADLINE_MS);
       let digest: string;
       try { parseHello(body); digest = await sha256Base64(body); }
       catch { return new Response(null, { status: 400 }); }
@@ -102,13 +167,11 @@ export class BootstrapRegistry {
         return this.#created(entry.sessionToken);
       }
       const sessionToken = randomToken();
-      const backendPort = Number(this.#env.BACKEND_PORT);
-      if (!Number.isInteger(backendPort) || backendPort < 1 || backendPort > 65535 || !this.#env.BACKEND_HOST) return new Response(null, { status: 500 });
       const session = this.#env.SESSIONS.get(this.#env.SESSIONS.idFromName(sessionToken));
       const initialized = await session.fetch(internalRequest('/init', sessionToken, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ token: sessionToken, backendHost: this.#env.BACKEND_HOST, backendPort, clientIp: request.headers.get('X-Client-IP') || '' })
+        body: JSON.stringify({ token: sessionToken, clientIp: request.headers.get('X-Client-IP') || '', expiresAt: Date.now() + SESSION_TTL_MS })
       }));
       if (!initialized.ok) return new Response(null, { status: 503, headers: { 'Retry-After': '1' } });
       entry.used = true;
@@ -131,15 +194,22 @@ export class BootstrapRegistry {
 
 export class RelaySession {
   readonly #state: DurableObjectState;
+  readonly #env: Env;
   #config: SessionConfig | undefined;
   #socket: WebSocket | undefined;
   #core: RelayCore | undefined;
   #batcher: WebSocketBatcher | undefined;
-  #receiveChain: Promise<void> = Promise.resolve();
+  #queue: SerializedInboundQueue<Uint8Array> | undefined;
+  #liveness: IdleLiveness | undefined;
+  #closing: Promise<void> | undefined;
 
-  constructor(state: DurableObjectState) {
+  constructor(state: DurableObjectState, env: Env) {
     this.#state = state;
-    state.blockConcurrencyWhile(async () => { this.#config = await state.storage.get<SessionConfig>('config'); });
+    this.#env = env;
+    state.blockConcurrencyWhile(async () => {
+      this.#config = await state.storage.get<SessionConfig>('config');
+      if (this.#config && this.#config.expiresAt <= Date.now()) { this.#config = undefined; await state.storage.deleteAll(); }
+    });
   }
 
   async fetch(request: Request): Promise<Response> {
@@ -148,13 +218,14 @@ export class RelaySession {
     if (url.pathname === '/init' && request.method === 'POST') {
       if (!validToken(token)) return new Response(null, { status: 404 });
       const incoming = await request.json<SessionConfig>();
-      if (incoming.token !== token || !incoming.backendHost || !Number.isInteger(incoming.backendPort)) return new Response(null, { status: 400 });
+      if (incoming.token !== token || !Number.isFinite(incoming.expiresAt) || incoming.expiresAt <= Date.now()) return new Response(null, { status: 400 });
       if (this.#config && this.#config.token !== token) return new Response(null, { status: 409 });
-      this.#config = { ...incoming, closed: false };
+      this.#config = incoming;
       await this.#state.storage.put('config', this.#config);
+      await this.#state.storage.setAlarm(this.#config.expiresAt);
       return new Response(null, { status: 204 });
     }
-    if (!this.#config || this.#config.closed || token !== this.#config.token) return new Response(null, { status: 404 });
+    if (!this.#config || token !== this.#config.token || this.#config.expiresAt <= Date.now()) return new Response(null, { status: 404 });
     if (url.pathname === '/close' && request.method === 'DELETE') {
       await this.#close();
       return new Response(null, { status: 204 });
@@ -170,21 +241,38 @@ export class RelaySession {
         packBytes: 32 * 1024, directBytes: 32 * 1024, delayMs: 1,
         maxPendingBytes: DEFAULT_LIMITS.maxPendingBytes, maxPendingItems: DEFAULT_LIMITS.maxPendingItems
       });
-      this.#core = new RelayCore({
-        backendHost: this.#config.backendHost, backendPort: this.#config.backendPort,
-        limits: DEFAULT_LIMITS, connector: new CloudflareSocketConnector(),
-        send: (batch) => { try { this.#batcher?.send(batch); } catch { void this.#close(); } },
-        closeCarrier: () => { void this.#close(); }
+      const secret = decodeSecret(this.#env.WEB_SECRET);
+      try {
+        const factory = connectorFactories.get(this);
+        this.#core = new RelayCore({
+          limits: DEFAULT_LIMITS, connector: factory ? factory(secret) : new TelegramConnector(secret, new CloudflareTelegramDialer()),
+          send: (batch) => { try { this.#batcher?.send(batch); } catch { void this.#close(); } },
+          closeCarrier: () => { void this.#close(); }
+        });
+      } finally { secret.fill(0); }
+      this.#queue = new SerializedInboundQueue({
+        maxBytes: DEFAULT_LIMITS.maxPendingBytes,
+        maxItems: DEFAULT_LIMITS.maxPendingItems,
+        size: (value) => value.byteLength + 256,
+        handle: async (value) => {
+          try { await this.#core?.receive(value); }
+          catch (error) { void this.#close(1002, 'protocol error'); throw error; }
+        }
       });
+      this.#liveness = new IdleLiveness(IDLE_PERIOD_MS, () => {
+        try { this.#batcher?.send(encodeFrame(FrameType.Ping, 0, crypto.getRandomValues(new Uint8Array(8)))); }
+        catch { void this.#close(); }
+      }, () => { void this.#close(1001, 'idle timeout'); });
+      this.#liveness.start();
       server.addEventListener('message', (event) => {
+        this.#liveness?.touch();
         if (typeof event.data === 'string') { void this.#close(1003, 'binary messages required'); return; }
         const bytes = event.data instanceof ArrayBuffer
           ? new Uint8Array(event.data)
           : ArrayBuffer.isView(event.data) ? new Uint8Array(event.data.buffer, event.data.byteOffset, event.data.byteLength) : null;
         if (!bytes || bytes.byteLength === 0 || bytes.byteLength > DEFAULT_LIMITS.maxCarrierBatchBytes) { void this.#close(1009, 'message limit'); return; }
-        this.#receiveChain = this.#receiveChain.then(async () => {
-          await this.#core?.receive(bytes);
-        }).catch(async () => { await this.#close(1002, 'protocol error'); });
+        const copy = bytes.slice();
+        if (!this.#queue?.push(copy)) void this.#close(1009, 'message queue limit');
       });
       server.addEventListener('close', () => { void this.#close(); });
       server.addEventListener('error', () => { void this.#close(); });
@@ -194,17 +282,26 @@ export class RelaySession {
   }
 
   async #close(code = 1000, reason = ''): Promise<void> {
-    if (!this.#config || this.#config.closed) return;
-    this.#config.closed = true;
-    this.#core?.close();
-    this.#batcher?.close();
-    const socket = this.#socket;
-    this.#socket = undefined;
-    this.#core = undefined;
-    this.#batcher = undefined;
-    try { socket?.close(code, reason); } catch { /* already closed */ }
-    await this.#state.storage.put('config', this.#config);
+    if (this.#closing) return this.#closing;
+    this.#closing = (async () => {
+      const socket = this.#socket;
+      this.#socket = undefined;
+      this.#liveness?.stop();
+      this.#liveness = undefined;
+      this.#queue?.clear();
+      this.#queue = undefined;
+      try { this.#core?.close(); } catch { /* shutdown must continue */ }
+      try { this.#batcher?.close(); } catch { /* shutdown must continue */ }
+      this.#core = undefined;
+      this.#batcher = undefined;
+      try { socket?.close(code, reason); } catch { /* already closed */ }
+      this.#config = undefined;
+      try { await this.#state.storage.deleteAll(); } finally { try { await this.#state.storage.deleteAlarm(); } catch { /* no alarm */ } }
+    })();
+    return this.#closing;
   }
+
+  async alarm(): Promise<void> { await this.#close(1001, 'session expired'); }
 }
 
 async function issueBridge(request: Request, env: Env): Promise<Response> {
@@ -222,12 +319,13 @@ async function createSession(request: Request, env: Env): Promise<Response> {
   const registry = env.BOOTSTRAPS.get(env.BOOTSTRAPS.idFromName('global'));
   const lookup = await registry.fetch(internalRequest('/lookup', token, { method: 'POST' }));
   if (!lookup.ok) return hidden(env);
-  const declared = Number(request.headers.get('Content-Length') || 0);
-  if (declared > CREATE_BODY_LIMIT) return hidden(env);
-  const body = new Uint8Array(await request.arrayBuffer());
-  if (body.byteLength > CREATE_BODY_LIMIT) return hidden(env);
+  const contentLength = request.headers.get('Content-Length');
+  if (contentLength && (!/^(0|[1-9][0-9]*)$/.test(contentLength) || Number(contentLength) > CREATE_BODY_LIMIT)) return hidden(env);
+  let body: Uint8Array;
+  try { body = await readBoundedBody(request.body, CREATE_BODY_LIMIT, CREATE_BODY_DEADLINE_MS); }
+  catch { return hidden(env); }
   const created = await registry.fetch(internalRequest('/create', token, {
-    method: 'POST', body,
+    method: 'POST', body: Uint8Array.from(body).buffer,
     headers: { 'Content-Type': 'application/octet-stream', 'X-Client-IP': request.headers.get('CF-Connecting-IP') || '' }
   }));
   if (created.status === 404 || created.status === 400) return hidden(env);
@@ -261,14 +359,18 @@ async function websocket(request: Request, env: Env): Promise<Response> {
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
-    if (request.method === 'GET' && url.pathname === '/' && url.searchParams.size === 1) {
-      const bridge = url.searchParams.get('bridge');
-      if (bridge && bridge.length === 43) {
+    if (request.method === 'GET' && url.pathname === '/') {
+      const match = /^\?bridge=([A-Za-z0-9_-]{43})$/.exec(url.search);
+      const bridge = match?.[1];
+      if (bridge) {
+        let secret: Uint8Array | undefined;
         try {
           validateHostname(env.PUBLIC_HOSTNAME);
-          const expected = await deriveCapability(env.PUBLIC_HOSTNAME, decodeSecret(env.WEB_SECRET));
-          if (bridge === expected) return issueBridge(request, env);
+          secret = decodeSecret(env.WEB_SECRET);
+          const expected = await deriveCapability(env.PUBLIC_HOSTNAME, secret);
+          if (constantTimeEqual(bridge, expected)) return issueBridge(request, env);
         } catch { return hidden(env); }
+        finally { secret?.fill(0); }
       }
     }
     if (url.pathname === '/api/v1/session' && request.method === 'POST') return createSession(request, env);

@@ -1,3 +1,8 @@
+/*
+ * SPDX-License-Identifier: GPL-3.0-only
+ * Derived from ToiCF/GrainTCP commit 1d22628 (HiinEnkelte).
+ * Modified by preauthn1 on 2026-08-23. See ../THIRD_PARTY_NOTICES.md.
+ */
 /** A bounded small-chunk collector adapted from GrainTCP's mkK/mkQ grain core. */
 export class GrainCollector {
   readonly #capacity: number;

@@ -32,9 +32,11 @@ export function base64Url(bytes: Uint8Array): string {
 
 export async function deriveCapability(hostname: string, secret: Uint8Array): Promise<string> {
   const keyBytes = Uint8Array.from(secret);
-  const key = await crypto.subtle.importKey('raw', keyBytes.buffer, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
-  const signature = await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(CONTEXT + hostname));
-  return base64Url(new Uint8Array(signature));
+  try {
+    const key = await crypto.subtle.importKey('raw', keyBytes.buffer, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+    const signature = await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(CONTEXT + hostname));
+    return base64Url(new Uint8Array(signature));
+  } finally { keyBytes.fill(0); }
 }
 
 export function randomToken(): string {

@@ -8,8 +8,6 @@ export default defineConfig({
       bindings: {
         WEB_SECRET: '000102030405060708090a0b0c0d0e0f',
         PUBLIC_HOSTNAME: 'proxy.example.com',
-        BACKEND_HOST: '127.0.0.1',
-        BACKEND_PORT: '2398',
         PUBLIC_SITE_TITLE: 'Example Public Site'
       }
     }

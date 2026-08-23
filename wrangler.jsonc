@@ -3,6 +3,8 @@
   "name": "tproxy-worker",
   "main": "src/index.ts",
   "compatibility_date": "2026-08-22",
+  "workers_dev": false,
+  "preview_urls": false,
   "durable_objects": {
     "bindings": [
       { "name": "BOOTSTRAPS", "class_name": "BootstrapRegistry" },

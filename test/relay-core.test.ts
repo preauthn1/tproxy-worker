@@ -1,9 +1,9 @@
 import { describe, expect, it, vi } from 'vitest';
 import { FrameType, INITIAL_STREAM_CREDIT, encodeFrame, parseRelayBatch } from '../src/frame';
 import { DEFAULT_LIMITS } from '../src/limits';
-import { RelayCore, type BackendConnection, type BackendConnector } from '../src/relay-core';
+import { RelayCore, type TelegramConnection, type TelegramConnectorLike } from '../src/relay-core';
 
-class MockConnection implements BackendConnection {
+class MockConnection implements TelegramConnection {
   writes: Uint8Array[] = [];
   closed = false;
   #reads: Uint8Array[] = [];
@@ -25,21 +25,20 @@ async function settle(): Promise<void> {
 
 function fixture(limitOverrides: Partial<typeof DEFAULT_LIMITS> = {}) {
   const connection = new MockConnection();
-  const connector: BackendConnector = { connect: vi.fn(async () => connection) };
+  const connector: TelegramConnectorLike = { open: vi.fn(() => connection) };
   const sent: Uint8Array[] = [];
   const core = new RelayCore({
-    backendHost: '127.0.0.1', backendPort: 2398,
     limits: { ...DEFAULT_LIMITS, ...limitOverrides }, connector,
-    send: (batch) => sent.push(batch.slice()), closeCarrier: vi.fn()
+    send: (batch) => sent.push(batch.slice()), closeCarrier: vi.fn(), writeTimeoutMs: 30_000
   });
   return { core, connector, connection, sent };
 }
 
 describe('relay session state and flow control', () => {
-  it('always dials the configured fixed backend', async () => {
+  it('opens an in-memory Telegram terminator without backend destination arguments', async () => {
     const { core, connector } = fixture();
     await core.receive(encodeFrame(FrameType.Open, 42));
-    expect(connector.connect).toHaveBeenCalledWith('127.0.0.1', 2398);
+    expect(connector.open).toHaveBeenCalledWith();
   });
 
   it('rejects DATA beyond the initial 4 MiB credit', async () => {
@@ -57,6 +56,17 @@ describe('relay session state and flow control', () => {
     const { core } = fixture();
     await core.receive(new Uint8Array([...encodeFrame(FrameType.Open, 5), ...encodeFrame(FrameType.Close, 5)]));
     await expect(core.receive(encodeFrame(FrameType.Open, 5))).rejects.toThrow(/reuse/i);
+  });
+
+  it('never permits an old stream id after bounded tombstone eviction', async () => {
+    const { core } = fixture({ maxClosedStreamIds: 2 });
+    for (const id of [1, 2, 3]) await core.receive(new Uint8Array([...encodeFrame(FrameType.Open, id), ...encodeFrame(FrameType.Close, id)]));
+    await expect(core.receive(encodeFrame(FrameType.Open, 1))).rejects.toThrow(/reuse/i);
+  });
+
+  it('requires OPEN ids to increase even within one carrier batch', async () => {
+    const { core } = fixture();
+    await expect(core.receive(new Uint8Array([...encodeFrame(FrameType.Open, 2), ...encodeFrame(FrameType.Open, 1)]))).rejects.toThrow(/reuse/i);
   });
 
   it('closes only an over-limit OPEN and preserves the session', async () => {
@@ -89,6 +99,41 @@ describe('relay session state and flow control', () => {
     const windows = sent.flatMap(parseRelayBatch).filter((frame) => frame.type === FrameType.Window);
     expect(windows).toHaveLength(1);
     expect(new DataView(windows[0]!.payload.buffer, windows[0]!.payload.byteOffset, 4).getUint32(0)).toBe(4);
+  });
+
+  it('does not return WINDOW before a deferred write resolves', async () => {
+    const { core, connection, sent } = fixture();
+    let release!: () => void;
+    connection.write = vi.fn(async (data: Uint8Array) => {
+      connection.writes.push(data.slice());
+      await new Promise<void>((resolve) => { release = resolve; });
+    });
+    const receive = core.receive(new Uint8Array([...encodeFrame(FrameType.Open, 1), ...encodeFrame(FrameType.Data, 1, new Uint8Array([1, 2, 3]))]));
+    await settle();
+    expect(sent.flatMap(parseRelayBatch).filter((frame) => frame.type === FrameType.Window)).toHaveLength(0);
+    release();
+    await receive;
+    expect(sent.flatMap(parseRelayBatch).filter((frame) => frame.type === FrameType.Window)).toHaveLength(1);
+  });
+
+  it('closes the carrier when a Telegram write exceeds the configured deadline', async () => {
+    vi.useFakeTimers();
+    try {
+      const connection = new MockConnection();
+      connection.write = vi.fn(() => new Promise<void>(() => undefined));
+      const closeCarrier = vi.fn();
+      const core = new RelayCore({
+        limits: DEFAULT_LIMITS,
+        connector: { open: () => connection },
+        send: vi.fn(), closeCarrier, writeTimeoutMs: 50
+      });
+      void core.receive(new Uint8Array([...encodeFrame(FrameType.Open, 1), ...encodeFrame(FrameType.Data, 1, new Uint8Array([1]))]));
+      await vi.advanceTimersByTimeAsync(49);
+      expect(closeCarrier).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(1);
+      expect(closeCarrier).toHaveBeenCalledTimes(1);
+      expect(connection.closed).toBe(true);
+    } finally { vi.useRealTimers(); }
   });
 
   it('closes all backends when the session closes', async () => {

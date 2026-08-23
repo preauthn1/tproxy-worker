@@ -1,3 +1,8 @@
+/*
+ * SPDX-License-Identifier: GPL-3.0-only
+ * Incorporates adapted GrainTCP batching behavior.
+ * Modified by preauthn1 on 2026-08-23. See ../THIRD_PARTY_NOTICES.md.
+ */
 import { GrainCollector } from './grain';
 
 interface BatcherOptions {
@@ -49,5 +54,10 @@ export class WebSocketBatcher {
     this.#items = 0;
   }
 
-  close(): void { this.flush(); }
+  close(): void {
+    if (this.#timer) clearTimeout(this.#timer);
+    this.#timer = undefined;
+    while (this.#collector.take()) { /* discard during noexcept shutdown */ }
+    this.#items = 0;
+  }
 }

@@ -1,8 +1,14 @@
+/*
+ * SPDX-License-Identifier: GPL-3.0-only
+ * Incorporates adapted GrainTCP BYOB-first read behavior.
+ * Modified by preauthn1 on 2026-08-23. See ../THIRD_PARTY_NOTICES.md.
+ */
 import { connect } from 'cloudflare:sockets';
-import type { BackendConnection, BackendConnector } from './relay-core';
+import type { DirectTelegramConnection, TelegramDialer } from './mtproxy';
 import { RELAY_DATA_CHUNK } from './frame';
+import type { TelegramEndpoint } from './telegram-dc';
 
-class CloudflareBackendConnection implements BackendConnection {
+class CloudflareTelegramConnection implements DirectTelegramConnection {
   readonly #socket: ReturnType<typeof connect>;
   readonly #writer: WritableStreamDefaultWriter<Uint8Array>;
   #closed = false;
@@ -48,10 +54,10 @@ class CloudflareBackendConnection implements BackendConnection {
   }
 }
 
-export class CloudflareSocketConnector implements BackendConnector {
-  async connect(hostname: string, port: number): Promise<BackendConnection> {
-    const socket = connect({ hostname, port }, { allowHalfOpen: false });
+export class CloudflareTelegramDialer implements TelegramDialer {
+  async connect(endpoint: TelegramEndpoint): Promise<DirectTelegramConnection> {
+    const socket = connect(endpoint, { allowHalfOpen: false });
     await socket.opened;
-    return new CloudflareBackendConnection(socket);
+    return new CloudflareTelegramConnection(socket);
   }
 }
