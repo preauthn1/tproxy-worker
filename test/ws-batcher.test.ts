@@ -40,4 +40,23 @@ describe('small downlink aggregation and large direct send', () => {
     expect(output).toHaveLength(5);
     expect(output.every((value) => value.byteLength <= DEFAULT_WEBSOCKET_BATCHER_OPTIONS.packBytes)).toBe(true);
   });
+
+  it('preserves byte and item headroom for control after DATA fills its partition', () => {
+    const output: Uint8Array[] = [];
+    const batcher = new WebSocketBatcher((value) => output.push(value), {
+      packBytes: 1024,
+      directBytes: 2048,
+      delayMs: 1000,
+      maxPendingBytes: 100,
+      maxPendingItems: 3,
+      controlReserveBytes: 20,
+      controlReserveItems: 1
+    });
+    batcher.send(new Uint8Array(40), false);
+    batcher.send(new Uint8Array(40), false);
+    expect(() => batcher.send(Uint8Array.of(1), false)).toThrow(/overflow/i);
+    expect(() => batcher.send(new Uint8Array(20), true)).not.toThrow();
+    batcher.flush();
+    expect(output.reduce((sum, value) => sum + value.byteLength, 0)).toBe(100);
+  });
 });

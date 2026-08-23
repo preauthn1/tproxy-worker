@@ -246,8 +246,12 @@ export class RelaySession {
         const factory = connectorFactories.get(this);
         this.#core = new RelayCore({
           limits: DEFAULT_LIMITS, connector: factory ? factory(secret) : new TelegramConnector(secret, new CloudflareTelegramDialer()),
-          send: (batch) => { try { this.#batcher?.send(batch); } catch { void this.#close(); } },
-          closeCarrier: () => { void this.#close(); }
+          send: (batch, control) => {
+            try { this.#batcher?.send(batch, control); }
+            catch { void this.#close(); }
+          },
+          closeCarrier: () => { void this.#close(); },
+          defer: (task) => this.#state.waitUntil(task)
         });
       } finally { secret.fill(0); }
       this.#queue = new SerializedInboundQueue({
@@ -260,7 +264,7 @@ export class RelaySession {
         }
       });
       this.#liveness = new IdleLiveness(IDLE_PERIOD_MS, () => {
-        try { this.#batcher?.send(encodeFrame(FrameType.Ping, 0, crypto.getRandomValues(new Uint8Array(8)))); }
+        try { this.#batcher?.send(encodeFrame(FrameType.Ping, 0, crypto.getRandomValues(new Uint8Array(8))), true); }
         catch { void this.#close(); }
       }, () => { void this.#close(1001, 'idle timeout'); });
       this.#liveness.start();
@@ -271,8 +275,7 @@ export class RelaySession {
           ? new Uint8Array(event.data)
           : ArrayBuffer.isView(event.data) ? new Uint8Array(event.data.buffer, event.data.byteOffset, event.data.byteLength) : null;
         if (!bytes || bytes.byteLength === 0 || bytes.byteLength > DEFAULT_LIMITS.maxCarrierBatchBytes) { void this.#close(1009, 'message limit'); return; }
-        const copy = bytes.slice();
-        if (!this.#queue?.push(copy)) void this.#close(1009, 'message queue limit');
+        if (!this.#queue?.push(bytes.slice())) void this.#close(1009, 'message queue limit');
       });
       server.addEventListener('close', () => { void this.#close(); });
       server.addEventListener('error', () => { void this.#close(); });

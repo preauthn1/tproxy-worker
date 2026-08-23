@@ -1,7 +1,8 @@
 import { describe, expect, it, vi } from 'vitest';
 import { FrameType, INITIAL_STREAM_CREDIT, encodeFrame, parseRelayBatch } from '../src/frame';
 import { DEFAULT_LIMITS } from '../src/limits';
-import { RelayCore, type TelegramConnection, type TelegramConnectorLike } from '../src/relay-core';
+import { RelayCore, WINDOW_FLUSH_BYTES, WINDOW_FLUSH_DELAY_MS, type TelegramConnection, type TelegramConnectorLike } from '../src/relay-core';
+import { SerializedInboundQueue } from '../src/session-guards';
 
 class MockConnection implements TelegramConnection {
   writes: Uint8Array[] = [];
@@ -90,16 +91,22 @@ describe('relay session state and flow control', () => {
   });
 
   it('returns WINDOW only after backend writes drain and batches small writes', async () => {
-    const { core, connection, sent } = fixture();
-    await core.receive(new Uint8Array([
-      ...encodeFrame(FrameType.Open, 1),
-      ...encodeFrame(FrameType.Data, 1, new Uint8Array([1, 2])),
-      ...encodeFrame(FrameType.Data, 1, new Uint8Array([3, 4]))
-    ]));
-    expect(connection.writes.map((value) => Array.from(value))).toEqual([[1, 2, 3, 4]]);
-    const windows = sent.flatMap(parseRelayBatch).filter((frame) => frame.type === FrameType.Window);
-    expect(windows).toHaveLength(1);
-    expect(new DataView(windows[0]!.payload.buffer, windows[0]!.payload.byteOffset, 4).getUint32(0)).toBe(4);
+    vi.useFakeTimers();
+    try {
+      const { core, connection, sent } = fixture();
+      await core.receive(new Uint8Array([
+        ...encodeFrame(FrameType.Open, 1),
+        ...encodeFrame(FrameType.Data, 1, new Uint8Array([1, 2])),
+        ...encodeFrame(FrameType.Data, 1, new Uint8Array([3, 4]))
+      ]));
+      await vi.advanceTimersByTimeAsync(0);
+      expect(connection.writes.map((value) => Array.from(value))).toEqual([[1, 2, 3, 4]]);
+      expect(sent.flatMap(parseRelayBatch).filter((frame) => frame.type === FrameType.Window)).toHaveLength(0);
+      await vi.advanceTimersByTimeAsync(WINDOW_FLUSH_DELAY_MS);
+      const windows = sent.flatMap(parseRelayBatch).filter((frame) => frame.type === FrameType.Window);
+      expect(windows).toHaveLength(1);
+      expect(new DataView(windows[0]!.payload.buffer, windows[0]!.payload.byteOffset, 4).getUint32(0)).toBe(4);
+    } finally { vi.useRealTimers(); }
   });
 
   it('drains independent stream uploads concurrently while preserving each stream order', async () => {
@@ -128,9 +135,116 @@ describe('relay session state and flow control', () => {
     expect(second.writes).toEqual([Uint8Array.of(2)]);
     releaseFirst();
     await receive;
+    await settle();
     expect(first.writes).toHaveLength(2);
     expect(first.writes[0]?.every((value) => value === 1)).toBe(true);
     expect(first.writes[1]?.every((value) => value === 3)).toBe(true);
+  });
+
+  it('does not let a blocked write hold later carrier messages or another stream', async () => {
+    const first = new MockConnection();
+    const second = new MockConnection();
+    const connections = [first, second];
+    let releaseFirst!: () => void;
+    first.write = vi.fn(async (data: Uint8Array) => {
+      first.writes.push(data.slice());
+      await new Promise<void>((resolve) => { releaseFirst = resolve; });
+    });
+    const core = new RelayCore({
+      connector: { open: () => connections.shift()! }, send: vi.fn(), closeCarrier: vi.fn()
+    });
+    const handled: number[] = [];
+    const queue = new SerializedInboundQueue<Uint8Array>({
+      maxBytes: DEFAULT_LIMITS.maxPendingBytes,
+      maxItems: DEFAULT_LIMITS.maxPendingItems,
+      size: (value) => value.byteLength + 256,
+      handle: async (value) => { await core.receive(value); handled.push(handled.length + 1); }
+    });
+
+    expect(queue.push(new Uint8Array([
+      ...encodeFrame(FrameType.Open, 1),
+      ...encodeFrame(FrameType.Data, 1, Uint8Array.of(1))
+    ]))).toBe(true);
+    expect(queue.push(new Uint8Array([
+      ...encodeFrame(FrameType.Window, 1, new Uint8Array([0, 0, 0, 1])),
+      ...encodeFrame(FrameType.Open, 2),
+      ...encodeFrame(FrameType.Data, 2, Uint8Array.of(2)),
+      ...encodeFrame(FrameType.Close, 1)
+    ]))).toBe(true);
+
+    await settle();
+    expect(handled).toEqual([1, 2]);
+    expect(second.writes).toEqual([Uint8Array.of(2)]);
+    expect(first.closed).toBe(true);
+    releaseFirst();
+    await queue.drained();
+  });
+
+  it('preserves exact same-stream order across separate carrier messages', async () => {
+    const { core, connection } = fixture();
+    let releaseFirst!: () => void;
+    connection.write = vi.fn(async (data: Uint8Array) => {
+      connection.writes.push(data.slice());
+      if (connection.writes.length === 1) await new Promise<void>((resolve) => { releaseFirst = resolve; });
+    });
+    await core.receive(new Uint8Array([
+      ...encodeFrame(FrameType.Open, 1),
+      ...encodeFrame(FrameType.Data, 1, Uint8Array.of(1))
+    ]));
+    await core.receive(encodeFrame(FrameType.Data, 1, Uint8Array.of(2)));
+    await core.receive(encodeFrame(FrameType.Data, 1, Uint8Array.of(3)));
+    await settle();
+    expect(connection.writes).toEqual([Uint8Array.of(1)]);
+    releaseFirst();
+    await settle();
+    expect(connection.writes).toEqual([Uint8Array.of(1), Uint8Array.of(2), Uint8Array.of(3)]);
+  });
+
+  it('keeps exactly one long-lived writer pump per open stream', async () => {
+    const { core, connection } = fixture();
+    await core.receive(encodeFrame(FrameType.Open, 1));
+    await core.receive(encodeFrame(FrameType.Data, 1, Uint8Array.of(1)));
+    await settle();
+    await core.receive(encodeFrame(FrameType.Data, 1, Uint8Array.of(2)));
+    await settle();
+    expect(connection.writes).toEqual([Uint8Array.of(1), Uint8Array.of(2)]);
+    core.close();
+  });
+
+  it('registers long-lived backend tasks with the runtime adapter', async () => {
+    const deferred: Promise<void>[] = [];
+    const connection = new MockConnection();
+    const core = new RelayCore({
+      connector: { open: () => connection }, send: vi.fn(), closeCarrier: vi.fn(),
+      defer: (task) => deferred.push(task)
+    });
+    await core.receive(encodeFrame(FrameType.Open, 1));
+    expect(deferred).toHaveLength(1);
+    core.close();
+    await Promise.all(deferred);
+  });
+
+  it('yields after a bounded writer turn when writes resolve immediately', async () => {
+    const { core, connection } = fixture();
+    await core.receive(encodeFrame(FrameType.Open, 1));
+    const receives: Array<Promise<void>> = [];
+    for (let index = 0; index < 257; index++) receives.push(core.receive(encodeFrame(FrameType.Data, 1, Uint8Array.of(index))));
+    await Promise.all(receives);
+    const beforeNextTurn = await new Promise<number>((resolve) => setTimeout(() => resolve(connection.writes.length), 0));
+    expect(beforeNextTurn).toBe(256);
+    await settle();
+    expect(connection.writes).toHaveLength(257);
+  });
+
+  it('bounds each stream writer queue independently', async () => {
+    const { core, connection } = fixture();
+    connection.write = vi.fn(() => new Promise<void>(() => undefined));
+    await core.receive(encodeFrame(FrameType.Open, 1));
+    for (let index = 0; index < 1024; index++) await core.receive(encodeFrame(FrameType.Data, 1, Uint8Array.of(index)));
+    await expect(core.receive(encodeFrame(FrameType.Data, 1, Uint8Array.of(1)))).rejects.toThrow(/stream.*queue/i);
+    expect(core.pendingItems).toBe(1024);
+    core.close();
+    expect(core.pendingItems).toBe(0);
   });
 
   it('encodes downlink from the backend view without an intermediate slice', async () => {
@@ -138,7 +252,7 @@ describe('relay session state and flow control', () => {
     const core = new RelayCore({ connector: { open: () => connection }, send: vi.fn(), closeCarrier: vi.fn() });
     await core.receive(encodeFrame(FrameType.Open, 1));
     const backend = new Uint8Array([1, 2, 3]);
-    const slice = vi.spyOn(Uint8Array.prototype, 'slice');
+    const slice = vi.spyOn(backend, 'slice');
     try {
       connection.emit(backend);
       await settle();
@@ -160,37 +274,111 @@ describe('relay session state and flow control', () => {
   });
 
   it('does not return WINDOW before a deferred write resolves', async () => {
-    const { core, connection, sent } = fixture();
-    let release!: () => void;
-    connection.write = vi.fn(async (data: Uint8Array) => {
-      connection.writes.push(data.slice());
-      await new Promise<void>((resolve) => { release = resolve; });
-    });
-    const receive = core.receive(new Uint8Array([...encodeFrame(FrameType.Open, 1), ...encodeFrame(FrameType.Data, 1, new Uint8Array([1, 2, 3]))]));
-    await settle();
-    expect(sent.flatMap(parseRelayBatch).filter((frame) => frame.type === FrameType.Window)).toHaveLength(0);
-    release();
-    await receive;
-    expect(sent.flatMap(parseRelayBatch).filter((frame) => frame.type === FrameType.Window)).toHaveLength(1);
+    vi.useFakeTimers();
+    try {
+      const { core, connection, sent } = fixture();
+      let release!: () => void;
+      connection.write = vi.fn(async (data: Uint8Array) => {
+        connection.writes.push(data.slice());
+        await new Promise<void>((resolve) => { release = resolve; });
+      });
+      await core.receive(new Uint8Array([...encodeFrame(FrameType.Open, 1), ...encodeFrame(FrameType.Data, 1, new Uint8Array([1, 2, 3]))]));
+      await vi.advanceTimersByTimeAsync(WINDOW_FLUSH_DELAY_MS);
+      expect(sent.flatMap(parseRelayBatch).filter((frame) => frame.type === FrameType.Window)).toHaveLength(0);
+      release();
+      await vi.advanceTimersByTimeAsync(WINDOW_FLUSH_DELAY_MS - 1);
+      expect(sent.flatMap(parseRelayBatch).filter((frame) => frame.type === FrameType.Window)).toHaveLength(0);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(sent.flatMap(parseRelayBatch).filter((frame) => frame.type === FrameType.Window)).toHaveLength(1);
+    } finally { vi.useRealTimers(); }
   });
 
-  it('closes the carrier when a Telegram write exceeds the configured deadline', async () => {
+  it('flushes drained receive credit at 256 KiB or after 20 ms', async () => {
+    vi.useFakeTimers();
+    try {
+      const { core, sent } = fixture();
+      await core.receive(new Uint8Array([
+        ...encodeFrame(FrameType.Open, 1),
+        ...encodeFrame(FrameType.Data, 1, new Uint8Array(WINDOW_FLUSH_BYTES - 1))
+      ]));
+      await vi.advanceTimersByTimeAsync(WINDOW_FLUSH_DELAY_MS - 1);
+      expect(sent.flatMap(parseRelayBatch).filter((frame) => frame.type === FrameType.Window)).toHaveLength(0);
+      await vi.advanceTimersByTimeAsync(1);
+      let windows = sent.flatMap(parseRelayBatch).filter((frame) => frame.type === FrameType.Window);
+      expect(windows.map((frame) => new DataView(frame.payload.buffer, frame.payload.byteOffset, 4).getUint32(0))).toEqual([WINDOW_FLUSH_BYTES - 1]);
+
+      await core.receive(encodeFrame(FrameType.Data, 1, new Uint8Array(WINDOW_FLUSH_BYTES)));
+      await vi.advanceTimersByTimeAsync(0);
+      windows = sent.flatMap(parseRelayBatch).filter((frame) => frame.type === FrameType.Window);
+      expect(windows.map((frame) => new DataView(frame.payload.buffer, frame.payload.byteOffset, 4).getUint32(0))).toEqual([
+        WINDOW_FLUSH_BYTES - 1,
+        WINDOW_FLUSH_BYTES
+      ]);
+    } finally { vi.useRealTimers(); }
+  });
+
+  it('releases queued accounting on CLOSE and ignores stale writer completion after id reuse', async () => {
+    vi.useFakeTimers();
+    try {
+      const first = new MockConnection();
+      const second = new MockConnection();
+      let releaseFirst!: () => void;
+      first.write = vi.fn(async (data: Uint8Array) => {
+        first.writes.push(data.slice());
+        await new Promise<void>((resolve) => { releaseFirst = resolve; });
+      });
+      const connections = [first, second];
+      const sent: Uint8Array[] = [];
+      const core = new RelayCore({
+        limits: { ...DEFAULT_LIMITS, maxClosedStreamIds: 0 },
+        connector: { open: () => connections.shift()! },
+        send: (value) => sent.push(value.slice()), closeCarrier: vi.fn()
+      });
+      await core.receive(new Uint8Array([
+        ...encodeFrame(FrameType.Open, 1),
+        ...encodeFrame(FrameType.Data, 1, Uint8Array.of(1))
+      ]));
+      await core.receive(encodeFrame(FrameType.Data, 1, Uint8Array.of(2)));
+      expect(core.pendingBytes).toBe(2 * (1 + 256));
+      expect(core.pendingItems).toBe(2);
+
+      await core.receive(encodeFrame(FrameType.Close, 1));
+      expect(core.pendingBytes).toBe(0);
+      expect(core.pendingItems).toBe(0);
+      await core.receive(encodeFrame(FrameType.Open, 1));
+      releaseFirst();
+      await vi.advanceTimersByTimeAsync(WINDOW_FLUSH_DELAY_MS);
+      expect(sent.flatMap(parseRelayBatch).filter((frame) => frame.type === FrameType.Window)).toHaveLength(0);
+      expect(core.pendingBytes).toBe(0);
+      expect(core.pendingItems).toBe(0);
+
+      await core.receive(encodeFrame(FrameType.Data, 1, Uint8Array.of(3)));
+      await vi.advanceTimersByTimeAsync(WINDOW_FLUSH_DELAY_MS);
+      const windows = sent.flatMap(parseRelayBatch).filter((frame) => frame.type === FrameType.Window);
+      expect(windows).toHaveLength(1);
+      expect(new DataView(windows[0]!.payload.buffer, windows[0]!.payload.byteOffset, 4).getUint32(0)).toBe(1);
+    } finally { vi.useRealTimers(); }
+  });
+
+  it('closes only the failing stream when a Telegram write exceeds its deadline', async () => {
     vi.useFakeTimers();
     try {
       const connection = new MockConnection();
       connection.write = vi.fn(() => new Promise<void>(() => undefined));
       const closeCarrier = vi.fn();
+      const sent: Uint8Array[] = [];
       const core = new RelayCore({
         limits: DEFAULT_LIMITS,
         connector: { open: () => connection },
-        send: vi.fn(), closeCarrier, writeTimeoutMs: 50
+        send: (value) => sent.push(value.slice()), closeCarrier, writeTimeoutMs: 50
       });
       void core.receive(new Uint8Array([...encodeFrame(FrameType.Open, 1), ...encodeFrame(FrameType.Data, 1, new Uint8Array([1]))]));
       await vi.advanceTimersByTimeAsync(49);
       expect(closeCarrier).not.toHaveBeenCalled();
       await vi.advanceTimersByTimeAsync(1);
-      expect(closeCarrier).toHaveBeenCalledTimes(1);
+      expect(closeCarrier).not.toHaveBeenCalled();
       expect(connection.closed).toBe(true);
+      expect(sent.flatMap(parseRelayBatch)).toMatchObject([{ type: FrameType.Close, streamId: 1 }]);
     } finally { vi.useRealTimers(); }
   });
 

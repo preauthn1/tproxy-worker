@@ -29,17 +29,17 @@ The repository started clean at commit `472ab5d18dde6936db2a670632678448762e0a4e
   buffer, so encoding directly from the backend view is sufficient.
 - Atomic carrier validation clones every live stream snapshot on every batch.
   Only streams touched by a batch need speculative state.
-- Upload grains for independent streams are drained serially. Per-stream order
-  must remain serial, but independent streams can drain concurrently and return
-  credit only after their own writes finish.
+- Phase 1 changed one `receive()` call to `Promise.all` its per-stream upload
+  drains. That removed only intra-batch serialization. `RelaySession` still
+  awaited `receive()`, so a backend write blocked every later WebSocket message,
+  including `WINDOW`, `CLOSE`, and unrelated-stream `DATA`.
 - `StreamingAes256Ctr` intentionally serializes WebCrypto calls to preserve a
   continuous counter and partial-block state. No parallel CTR change is planned
   without a byte-exact proof.
-- The official server additionally coalesces adjacent `DATA`, coalesces `WINDOW`,
-  batches carrier frames, and reserves capacity for control traffic. This pass
-  obtains carrier batching from the larger pack and coalesces upload data through
-  `GrainCollector`; more elaborate class-specific reservation is deferred unless
-  deterministic tests show the current bounded queue can starve control traffic.
+- Desktop flushes receive credit at 256 KiB or 20 ms, limits one synchronous
+  stream-flush turn to 256 frames, and keeps 64 KiB / 64 items of local carrier
+  capacity for control. The server also accounts queued backend writes until
+  completion and releases them on stream close.
 
 ## Design
 
@@ -53,15 +53,37 @@ The repository started clean at commit `472ab5d18dde6936db2a670632678448762e0a4e
 4. Validate relay batches with a per-batch overlay containing only touched stream
    state. Do not mutate live state until the complete batch and pending budget
    validate.
-5. Drain each stream's collector in its own promise and await all drains. Preserve
-   order within one stream and return one atomic `WINDOW` per successful drain.
-6. Encode downlink directly from the backend read view. `encodeFrame` owns the
+5. Give each stream an owned, bounded backend-write queue and one long-lived
+   writer pump that sleeps on an explicit wake queue when idle. `receive()`
+   atomically validates/reserves and copies accepted `DATA` into those
+   queues, applies `OPEN`/`WINDOW`/`CLOSE`, and returns without awaiting a backend
+   write. Preserve exact same-stream order across carrier messages. A close drops
+   queued byte/item charges and identity-checks prevent a stale completion from
+   mutating a reused stream. The Durable Object adapter registers the long-lived
+   backend pumps with `state.waitUntil`; the relay itself stays on the standard
+   non-hibernating WebSocket API because its live TCP/cipher state is in memory.
+6. Return receive credit only for successful backend writes. Coalesce it per
+   stream at 256 KiB or 20 ms, cancel it on stream/session close, and split only
+   above the `uint32` frame limit.
+7. Close only the failed stream on a backend write deadline. Phase 1 closed the
+   whole carrier, but neither the frame contract nor the reference server
+   requires an unrelated-stream failure for one backend write timeout.
+8. Preserve carrier control headroom: relay `WINDOW`/`CLOSE` and session `PING`
+   use the control class, while `DATA` cannot use the final 64 KiB / 64 items.
+9. Yield a hot writer pump after 256 completed items. This bounds a synchronous
+   microtask turn without relaxing per-stream order.
+10. Encode downlink directly from the backend read view. `encodeFrame` owns the
    resulting allocation before it crosses the asynchronous batching boundary.
-7. Validate an entire bridge message first. If no stream-zero `PING` exists,
+11. Validate an entire bridge message first. If no stream-zero `PING` exists,
    transfer it once; otherwise retain the exact per-frame PING/PONG path.
-8. Add `npm run bench` covering frame parse/encode, both queues, WebSocket message
-   counts/bytes, AES-CTR representative sizes, and a RelayCore multi-frame path.
-   Time is report-only. Deterministic counts are asserted in tests.
+12. Keep the standard Durable Object WebSocket API for the lifetime of the live
+   TCP relay. Do not enable WebSocket hibernation for an in-memory relay whose
+   TCP sockets, ciphers, credits, queues, and timers cannot be reconstructed after
+   eviction. The non-hibernating socket also keeps delayed batching in the same
+   live object context.
+13. Extend `npm run bench` with cross-message HOL counts: both `receive()` calls
+   complete while stream 1 is blocked, stream 2 writes before release, and stream
+   1 completes in order afterward. Timing is report-only and has no threshold.
 
 ## Measurements
 
@@ -86,6 +108,9 @@ The deterministic batching result for 32 encoded normal-size `DATA` frames was
 32 WebSocket messages / 2,097,408 bytes with the legacy 32 KiB profile and 5
 WebSocket messages / the same 2,097,408 bytes with the 512 KiB profile. The
 regression test also asserts that every resulting message is at most 512 KiB.
+This is a generic `WebSocketBatcher` measurement. The same profile is used by
+the non-hibernating Durable Object relay, but the count remains a deterministic
+local batching result rather than a production-network throughput claim.
 
 The queue benchmark suggests approximately 9.8x higher collector drain rate and
 7.4x higher serialized inbound drain rate in this Node run. These ratios measure
@@ -97,3 +122,42 @@ Cloudflare workerd evidence comes from the Vitest Worker integration suite and
 the Wrangler dry-run gate. It verifies protocol behavior and bundle compatibility;
 it does not provide production network, CPU, memory, or Telegram-DC throughput
 evidence. No production performance claim is made.
+
+## Phase 2 verification targets
+
+- Cross-message HOL: a blocked stream-1 write does not hold a later carrier
+  message containing stream-1 `WINDOW`/`CLOSE` and stream-2 `DATA`.
+- Ordering: separate carrier messages remain exactly ordered within one stream.
+- Accounting: queued and in-flight upload cost is released on `CLOSE`; stale
+  completion cannot emit `WINDOW` or alter a tombstone-evicted/reused stream.
+- Credit: `WINDOW` totals never exceed bytes actually written, and pending credit
+  is canceled on stream/session close.
+- Backpressure: each stream has its own 8 MiB / 1024-item cap, within the session
+  cap, and carrier DATA cannot consume the control reserve.
+
+## Phase 2 measurements
+
+After the writer-pump change, `npm run bench` was run five times on Node.js
+`v22.23.2`, Linux x64. Medians remain report-only.
+
+| Benchmark | Five-run median |
+| --- | ---: |
+| Frame encode, 64 KiB payload | 1,904.8 MiB/s |
+| Frame parse, 64 KiB frame | 9,213.8 MiB/s |
+| Legacy `GrainCollector` drain | 230,710 items/s |
+| Current head-index `GrainCollector` drain | 2,071,530 items/s |
+| Legacy serialized inbound drain | 249,009 items/s |
+| Current head-index inbound drain | 1,810,039 items/s |
+| AES-CTR, 4 KiB chunks | 24.2 MiB/s |
+| AES-CTR, 64 KiB chunks | 146.3 MiB/s |
+| AES-CTR, 512 KiB chunks | 215.2 MiB/s |
+| RelayCore, 16-frame upload batches | 149,212 frames/s |
+| Cross-message HOL elapsed | 3.04 ms |
+
+All five HOL runs reported the same semantic counts: two `receive()` calls
+completed before releasing stream 1; stream 1 had one blocked write; stream 2
+completed one write; after release stream 1 had two writes with ordered checksum
+5 (`1*1 + 2*2`). The elapsed value is diagnostic only and has no pass/fail
+threshold. The upload benchmark was reduced from 500 to 60 batches so its total
+input stays within the protocol's initial 4 MiB receive credit; it does not
+synthetically grant credit that the peer did not receive.

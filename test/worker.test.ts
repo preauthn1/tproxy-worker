@@ -215,7 +215,7 @@ describe('Worker and Durable Object integration', () => {
     await waitFor(() => dc.writes.reduce((sum, value) => sum + value.byteLength, 0) === expectedDcWrite.byteLength);
     expect(dc.writes[0]).toEqual(Uint8Array.of(0xee, 0xee, 0xee, 0xee));
     expect(concatenate(...dc.writes)).toEqual(expectedDcWrite);
-    dc.emit(vector.clearResponse);
+    await runInDurableObject(stub, () => { dc.emit(vector.clearResponse); });
     await waitFor(() => incoming.flatMap((batch) => parseRelayBatch(batch)).some((frame) => frame.type === FrameType.Data));
     const encrypted = incoming.flatMap((batch) => parseRelayBatch(batch)).filter((frame) => frame.type === FrameType.Data).map((frame) => frame.payload);
     expect(concatenate(...encrypted)).toEqual(vector.transformedResponse);

@@ -152,12 +152,65 @@ async function relayBenchmark(): Promise<TimedResult> {
   const frame = encodeFrame(FrameType.Data, 1, new Uint8Array(4096));
   const batch = new Uint8Array(frame.byteLength * 16);
   for (let index = 0; index < 16; index++) batch.set(frame, index * frame.byteLength);
-  const iterations = 500;
+  const iterations = 60;
   const result = await timedAsync('RelayCore 16-frame upload batches', iterations * 16, 'frames', async () => {
     for (let index = 0; index < iterations; index++) await core.receive(batch);
   });
   core.close();
   return result;
+}
+
+async function relayHolMetrics(): Promise<Record<string, number | string>> {
+  class Connection implements TelegramConnection {
+    writes: Uint8Array[] = [];
+    release: (() => void) | undefined;
+    readonly blockFirst: boolean;
+    constructor(blockFirst = false) { this.blockFirst = blockFirst; }
+    async write(data: Uint8Array): Promise<void> {
+      this.writes.push(data.slice());
+      if (this.blockFirst && this.writes.length === 1) await new Promise<void>((resolve) => { this.release = resolve; });
+    }
+    async *read(): AsyncIterable<Uint8Array> {
+      const pending: Uint8Array[] = [];
+      for (const value of pending) yield value;
+      await new Promise<void>(() => undefined);
+    }
+    close(): void { this.release?.(); }
+  }
+  const first = new Connection(true);
+  const second = new Connection();
+  const connections = [first, second];
+  const core = new RelayCore({ connector: { open: () => connections.shift()! }, send: () => undefined, closeCarrier: () => undefined });
+  const start = performance.now();
+  let completedReceives = 0;
+  await core.receive(new Uint8Array([
+    ...encodeFrame(FrameType.Open, 1),
+    ...encodeFrame(FrameType.Data, 1, Uint8Array.of(1))
+  ]));
+  completedReceives++;
+  await core.receive(new Uint8Array([
+    ...encodeFrame(FrameType.Data, 1, Uint8Array.of(2)),
+    ...encodeFrame(FrameType.Open, 2),
+    ...encodeFrame(FrameType.Data, 2, Uint8Array.of(3))
+  ]));
+  completedReceives++;
+  await new Promise<void>((resolve) => setTimeout(resolve, 0));
+  const blockedStreamWritesBeforeRelease = first.writes.length;
+  const independentStreamWritesBeforeRelease = second.writes.length;
+  first.release?.();
+  await new Promise<void>((resolve) => setTimeout(resolve, 0));
+  const orderedChecksum = first.writes.reduce((sum, value, index) => sum + (index + 1) * (value[0] ?? 0), 0);
+  const milliseconds = performance.now() - start;
+  core.close();
+  return {
+    label: 'RelayCore cross-message HOL',
+    milliseconds: Number(milliseconds.toFixed(2)),
+    completedReceivesBeforeRelease: completedReceives,
+    blockedStreamWritesBeforeRelease,
+    independentStreamWritesBeforeRelease,
+    blockedStreamWritesAfterRelease: first.writes.length,
+    orderedChecksum
+  };
 }
 
 function printTimed(result: TimedResult): void {
@@ -174,6 +227,7 @@ async function main(): Promise<void> {
   for (const metric of batcherMetrics()) process.stdout.write(`${JSON.stringify(metric)}\n`);
   for (const result of await aesBenchmarks()) printTimed(result);
   printTimed(await relayBenchmark());
+  process.stdout.write(`${JSON.stringify(await relayHolMetrics())}\n`);
 }
 
 await main();

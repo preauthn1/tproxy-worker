@@ -11,6 +11,8 @@ interface BatcherOptions {
   delayMs: number;
   maxPendingBytes?: number;
   maxPendingItems?: number;
+  controlReserveBytes?: number;
+  controlReserveItems?: number;
 }
 
 export const DEFAULT_WEBSOCKET_BATCHER_OPTIONS: Readonly<BatcherOptions> = Object.freeze({
@@ -33,18 +35,27 @@ export class WebSocketBatcher {
     this.#options = {
       ...options,
       maxPendingBytes: options.maxPendingBytes ?? 12 * 1024 * 1024,
-      maxPendingItems: options.maxPendingItems ?? 8192
+      maxPendingItems: options.maxPendingItems ?? 8192,
+      controlReserveBytes: options.controlReserveBytes ?? 64 * 1024,
+      controlReserveItems: options.controlReserveItems ?? 64
     };
   }
 
-  send(value: Uint8Array): void {
+  send(value: Uint8Array, control = false): void {
     if (value.byteLength === 0) return;
+    if (control) {
+      this.flush();
+      this.#emit(value);
+      return;
+    }
     if (value.byteLength >= this.#options.directBytes) {
       this.flush();
       this.#emit(value);
       return;
     }
-    if (this.#collector.bytes + value.byteLength > this.#options.maxPendingBytes || this.#items >= this.#options.maxPendingItems) {
+    const bytesLimit = Math.max(0, this.#options.maxPendingBytes - this.#options.controlReserveBytes);
+    const itemsLimit = Math.max(0, this.#options.maxPendingItems - this.#options.controlReserveItems);
+    if (this.#collector.bytes + value.byteLength > bytesLimit || this.#items >= itemsLimit) {
       throw new Error('downlink queue overflow');
     }
     if (!this.#collector.empty && this.#collector.bytes + value.byteLength > this.#options.packBytes) this.flush();
