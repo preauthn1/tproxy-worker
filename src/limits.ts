@@ -8,7 +8,7 @@ export interface RelayLimits {
 }
 
 export const DEFAULT_LIMITS: RelayLimits = Object.freeze({
-  maxStreams: 64,
+  maxStreams: 128,
   maxClosedStreamIds: 4096,
   maxPendingBytes: 12 * 1024 * 1024,
   maxPendingItems: 8192,

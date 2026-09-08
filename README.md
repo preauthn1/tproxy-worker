@@ -33,7 +33,7 @@ Telegram DC selected by the authenticated 64-byte obfuscated2 header
 - 精确 `HELLO`、有界 request body、bootstrap 幂等兑换、`WELCOME`、session expiry alarm。
 - 精确 `tproxy-v1.<session-token>` WebSocket subprotocol、单 WebSocket/session、binary-only、2 MiB carrier cap、有界串行输入队列和 idle ping/close。
 - `OPEN/DATA/CLOSE/WINDOW`、4 MiB 双向初始 credit、1 MiB frame payload、64 KiB relay chunks；stream ID 只拒绝 active/tombstoned 重用，bounded tombstone 淘汰后允许 24-bit 计数回绕。
-- 64 streams/session、12 MiB / 8192 items pending/session、每流有界有序 writer pump、单流 write deadline、256 KiB / 20 ms WINDOW 合并、closed-ID tombstones、WebSocket 断开时关闭所有 TCP sockets。
+- 128 streams/session、12 MiB / 8192 items pending/session、每流有界有序 writer pump、单流 write deadline、256 KiB / 20 ms WINDOW 合并、closed-ID tombstones、WebSocket 断开时关闭所有 TCP sockets。
 - Streaming AES-256-CTR obfuscated2 termination、三种 transport marker、signed DC validation、确定性 DC candidate failover、加密 DC response 回程。
 - GrainTCP 衍生的 bounded grain batching、BYOB-first socket reads 和小下行短门控聚合。
 - 未认证路径、错误 method/header/token/capability 均表现为公开网站或相同的无描述 404 页面。

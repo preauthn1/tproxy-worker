@@ -37,7 +37,7 @@ function fixture(limitOverrides: Partial<typeof DEFAULT_LIMITS> = {}) {
 
 describe('relay session state and flow control', () => {
   it('keeps room for Telegram Desktop concurrent streams within the session budget', () => {
-    expect(DEFAULT_LIMITS.maxStreams).toBe(64);
+    expect(DEFAULT_LIMITS.maxStreams).toBe(128);
   });
 
   it('opens an in-memory Telegram terminator without backend destination arguments', async () => {
