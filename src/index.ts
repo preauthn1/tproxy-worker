@@ -9,9 +9,14 @@ import { CloudflareTelegramDialer } from './tcp';
 import { DEFAULT_WEBSOCKET_BATCHER_OPTIONS, WebSocketBatcher } from './ws-batcher';
 import { IdleLiveness, SerializedInboundQueue, readBoundedBody } from './session-guards';
 import { isRegion, regionFor, regionalToken, registryStub, tokenRegion } from './region';
+import { LANE_MAX_PENDING_BYTES, LANE_MAX_PENDING_ITEMS, LaneOverflow, LaneRouter, parseLaneProtocol, validateLaneMessage } from './lanes';
+
+export type CarrierMode = 'websocket' | 'websocket-lanes';
+export function carrierModeOf(env: Env): CarrierMode { return env.CARRIER_MODE === 'websocket-lanes' ? 'websocket-lanes' : 'websocket'; }
 
 interface BootstrapEntry {
   expiresAt: number;
+  carrierMode?: CarrierMode;
   issuanceIp: string;
   used: boolean;
   bodyDigest?: string;
@@ -20,6 +25,7 @@ interface BootstrapEntry {
 
 interface SessionConfig {
   token: string;
+  carrierMode?: CarrierMode;
   clientIp: string;
   expiresAt: number;
 }
@@ -34,6 +40,8 @@ const MAX_BOOTSTRAPS = 512;
 const BOOTSTRAP_RATE_WINDOW_MS = 60_000;
 const BOOTSTRAP_RATE_BURST = 256;
 const IDLE_PERIOD_MS = 75_000;
+// A lanes session with no attached lane is reclaimed after this long (client vanished without DELETE).
+const LANE_IDLE_MS = 5 * 60_000;
 
 type ConnectorFactory = (secret: Uint8Array) => TelegramConnectorLike;
 const connectorFactories = new WeakMap<RelaySession, ConnectorFactory>();
@@ -92,7 +100,8 @@ export class BootstrapRegistry {
       return new Response(null, { status: 204 });
     }
     if (url.pathname === '/issue' && request.method === 'POST') {
-      return this.#serializeIssue(() => this.#issue(token, request.headers.get('X-Client-IP') || ''));
+      const mode: CarrierMode = request.headers.get('X-Carrier-Mode') === 'websocket-lanes' ? 'websocket-lanes' : 'websocket';
+      return this.#serializeIssue(() => this.#issue(token, request.headers.get('X-Client-IP') || '', mode));
     }
     const key = `bootstrap:${token}`;
     const entry = await this.#state.storage.get<BootstrapEntry>(key);
@@ -120,13 +129,13 @@ export class BootstrapRegistry {
     return result;
   }
 
-  async #issue(token: string, issuanceIp: string): Promise<Response> {
+  async #issue(token: string, issuanceIp: string, carrierMode: CarrierMode): Promise<Response> {
     const now = Date.now();
     const rate = await this.#state.storage.get<{ start: number; count: number }>('bootstrap-rate') ?? { start: now, count: 0 };
     if (now - rate.start >= BOOTSTRAP_RATE_WINDOW_MS) { rate.start = now; rate.count = 0; }
     const active = await this.#activeBootstraps(now);
     if (active.length >= MAX_BOOTSTRAPS || rate.count >= BOOTSTRAP_RATE_BURST) return new Response(null, { status: 429, headers: { 'Retry-After': '1' } });
-    const entry: BootstrapEntry = { expiresAt: now + BOOTSTRAP_TTL_MS, issuanceIp, used: false };
+    const entry: BootstrapEntry = { expiresAt: now + BOOTSTRAP_TTL_MS, issuanceIp, used: false, carrierMode };
     rate.count++;
     await this.#state.storage.put({ [`bootstrap:${token}`]: entry, 'bootstrap-rate': rate });
     await this.#scheduleAlarm(active.map(([, value]) => value.expiresAt).concat(entry.expiresAt));
@@ -166,7 +175,7 @@ export class BootstrapRegistry {
       catch { return new Response(null, { status: 400 }); }
       if (entry.used) {
         if (entry.bodyDigest !== digest || !entry.sessionToken) return new Response(null, { status: 404 });
-        return this.#created(entry.sessionToken);
+        return this.#created(entry.sessionToken, entry.carrierMode ?? 'websocket');
       }
       const regionHeader = request.headers.get(INTERNAL_REGION);
       const region = isRegion(regionHeader) ? regionHeader : undefined;
@@ -175,22 +184,22 @@ export class BootstrapRegistry {
       const initialized = await session.fetch(internalRequest('/init', sessionToken, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ token: sessionToken, clientIp: request.headers.get('X-Client-IP') || '', expiresAt: Date.now() + SESSION_TTL_MS })
+        body: JSON.stringify({ token: sessionToken, carrierMode: entry.carrierMode ?? 'websocket', clientIp: request.headers.get('X-Client-IP') || '', expiresAt: Date.now() + SESSION_TTL_MS })
       }));
       if (!initialized.ok) return new Response(null, { status: 503, headers: { 'Retry-After': '1' } });
       entry.used = true;
       entry.bodyDigest = digest;
       entry.sessionToken = sessionToken;
       await this.#state.storage.put(key, entry);
-      return this.#created(sessionToken);
+      return this.#created(sessionToken, entry.carrierMode ?? 'websocket');
   }
 
-  #created(sessionToken: string): Response {
+  #created(sessionToken: string, carrierMode: CarrierMode): Response {
     return new Response(Uint8Array.from(encodeFrame(FrameType.Welcome, 0)).buffer, {
       status: 200,
       headers: {
         'Content-Type': 'application/octet-stream', 'Cache-Control': 'no-store',
-        'X-Session-Token': sessionToken, 'X-Down-Cursor': '0', 'X-Carrier-Mode': 'websocket'
+        'X-Session-Token': sessionToken, 'X-Down-Cursor': '0', 'X-Carrier-Mode': carrierMode
       }
     });
   }
@@ -206,6 +215,9 @@ export class RelaySession {
   #queue: SerializedInboundQueue<Uint8Array> | undefined;
   #liveness: IdleLiveness | undefined;
   #closing: Promise<void> | undefined;
+  #router: LaneRouter | undefined;
+  readonly #laneQueues = new Map<number, SerializedInboundQueue<Uint8Array>>();
+  #laneIdle: ReturnType<typeof setTimeout> | undefined;
 
   constructor(state: DurableObjectState, env: Env) {
     this.#state = state;
@@ -235,7 +247,11 @@ export class RelaySession {
       return new Response(null, { status: 204 });
     }
     if (url.pathname === '/ws' && request.method === 'GET') {
-      if (this.#socket) return new Response(null, { status: 409 });
+      const laneHeader = request.headers.get('X-Lane-Id');
+      const lanesMode = this.#config.carrierMode === 'websocket-lanes';
+      if (lanesMode !== (laneHeader !== null)) return new Response(null, { status: 404 });
+      if (lanesMode) return this.#acceptLane(Number(laneHeader));
+      if (this.#socket || this.#core) return new Response(null, { status: 409 });
       const pair = new WebSocketPair();
       const [client, server] = Object.values(pair) as [WebSocket, WebSocket];
       server.accept({ allowHalfOpen: true });
@@ -245,18 +261,10 @@ export class RelaySession {
         ...DEFAULT_WEBSOCKET_BATCHER_OPTIONS,
         maxPendingBytes: DEFAULT_LIMITS.maxPendingBytes, maxPendingItems: DEFAULT_LIMITS.maxPendingItems
       });
-      const secret = decodeSecret(this.#env.WEB_SECRET);
-      try {
-        const factory = connectorFactories.get(this);
-        this.#core = new RelayCore({
-          limits: DEFAULT_LIMITS, connector: factory ? factory(secret) : new TelegramConnector(secret, new CloudflareTelegramDialer()),
-          send: (batch, control) => {
-            try { this.#batcher?.send(batch, control); }
-            catch { void this.#close(); }
-          },
-          closeCarrier: () => { void this.#close(); }
-        });
-      } finally { secret.fill(0); }
+      this.#core = this.#createCore((batch, control) => {
+        try { this.#batcher?.send(batch, control); }
+        catch { void this.#close(); }
+      });
       this.#queue = new SerializedInboundQueue({
         maxBytes: DEFAULT_LIMITS.maxPendingBytes,
         maxItems: DEFAULT_LIMITS.maxPendingItems,
@@ -289,6 +297,92 @@ export class RelaySession {
     return new Response(null, { status: 404 });
   }
 
+  #createCore(send: (batch: Uint8Array, control?: boolean) => void): RelayCore {
+    const secret = decodeSecret(this.#env.WEB_SECRET);
+    try {
+      const factory = connectorFactories.get(this);
+      return new RelayCore({
+        limits: DEFAULT_LIMITS, connector: factory ? factory(secret) : new TelegramConnector(secret, new CloudflareTelegramDialer()),
+        send,
+        closeCarrier: () => { void this.#close(); }
+      });
+    } finally { secret.fill(0); }
+  }
+
+  /** websocket-lanes: one WebSocket per shared stream id, all sharing this session's RelayCore. */
+  #acceptLane(streamId: number): Response {
+    if (!Number.isSafeInteger(streamId) || streamId <= 0 || streamId > 0xffffff) return new Response(null, { status: 404 });
+    if (!this.#router) {
+      const router = new LaneRouter(DEFAULT_LIMITS.maxStreams);
+      this.#router = router;
+      this.#core = this.#createCore((batch, control) => {
+        try { router.route(batch, control); }
+        catch (error) {
+          // Per-lane downlink overflow isolates only that lane.
+          if (error instanceof LaneOverflow) this.#dropLane(error.streamId, 1011, 'lane overflow');
+          else void this.#close();
+        }
+      });
+    }
+    const router = this.#router;
+    if (!router.canAttach(streamId)) return new Response(null, { status: 409 });
+    const pair = new WebSocketPair();
+    const [client, server] = Object.values(pair) as [WebSocket, WebSocket];
+    server.accept({ allowHalfOpen: true });
+    server.binaryType = 'arraybuffer';
+    router.attach(streamId, server);
+    this.#cancelLaneIdle();
+    const queue = new SerializedInboundQueue<Uint8Array>({
+      maxBytes: LANE_MAX_PENDING_BYTES,
+      maxItems: LANE_MAX_PENDING_ITEMS,
+      size: (value) => value.byteLength + 256,
+      handle: async (value) => {
+        try {
+          const error = validateLaneMessage(value, streamId, !router.isOpened(streamId));
+          if (error) throw new Error(error);
+          await this.#core?.receive(value);
+          router.markOpened(streamId);
+          // A client CLOSE (or refused OPEN) completes the lane.
+          if (!this.#core?.hasStream(streamId)) this.#dropLane(streamId, 1000, 'stream closed');
+        } catch (error) {
+          this.#dropLane(streamId, 1002, 'lane protocol error');
+          throw error;
+        }
+      }
+    });
+    this.#laneQueues.set(streamId, queue);
+    server.addEventListener('message', (event) => {
+      if (typeof event.data === 'string') { this.#dropLane(streamId, 1003, 'binary messages required'); return; }
+      const owned = event.data instanceof ArrayBuffer;
+      const bytes = owned
+        ? new Uint8Array(event.data as ArrayBuffer)
+        : ArrayBuffer.isView(event.data) ? new Uint8Array(event.data.buffer, event.data.byteOffset, event.data.byteLength) : null;
+      if (!bytes || bytes.byteLength === 0 || bytes.byteLength > DEFAULT_LIMITS.maxCarrierBatchBytes) { this.#dropLane(streamId, 1009, 'message limit'); return; }
+      if (!queue.push(owned ? bytes : bytes.slice())) this.#dropLane(streamId, 1009, 'lane queue limit');
+    });
+    server.addEventListener('close', () => { this.#dropLane(streamId); });
+    server.addEventListener('error', () => { this.#dropLane(streamId); });
+    return new Response(null, { status: 101, webSocket: client, headers: { 'Sec-WebSocket-Extensions': '' } });
+  }
+
+  #dropLane(streamId: number, code = 1000, reason = ''): void {
+    const queue = this.#laneQueues.get(streamId);
+    if (queue) { this.#laneQueues.delete(streamId); queue.clear(); }
+    this.#router?.detach(streamId, code, reason);
+    try { this.#core?.abortStream(streamId); } catch { /* already closed */ }
+    if (this.#router && this.#router.size === 0 && !this.#closing) this.#scheduleLaneIdle();
+  }
+
+  #scheduleLaneIdle(): void {
+    if (this.#laneIdle) return;
+    this.#laneIdle = setTimeout(() => { this.#laneIdle = undefined; if (this.#router?.size === 0) void this.#close(1001, 'idle timeout'); }, LANE_IDLE_MS);
+  }
+
+  #cancelLaneIdle(): void {
+    if (this.#laneIdle) clearTimeout(this.#laneIdle);
+    this.#laneIdle = undefined;
+  }
+
   async #close(code = 1000, reason = ''): Promise<void> {
     if (this.#closing) return this.#closing;
     this.#closing = (async () => {
@@ -296,6 +390,12 @@ export class RelaySession {
       this.#socket = undefined;
       this.#liveness?.stop();
       this.#liveness = undefined;
+      this.#cancelLaneIdle();
+      for (const queue of this.#laneQueues.values()) queue.clear();
+      this.#laneQueues.clear();
+      const router = this.#router;
+      this.#router = undefined;
+      try { router?.closeAll(code, reason); } catch { /* shutdown must continue */ }
       this.#queue?.clear();
       this.#queue = undefined;
       try { this.#core?.close(); } catch { /* shutdown must continue */ }
@@ -322,9 +422,10 @@ async function issueBridge(request: Request, env: Env): Promise<Response> {
   const region = regionFor(request.cf as Parameters<typeof regionFor>[0]);
   const token = regionalToken(region);
   const registry = registryStub(env.BOOTSTRAPS, region);
-  const issued = await registry.fetch(internalRequest('/issue', token, { method: 'POST', headers: { 'X-Client-IP': request.headers.get('CF-Connecting-IP') || '' } }));
+  const mode = carrierModeOf(env);
+  const issued = await registry.fetch(internalRequest('/issue', token, { method: 'POST', headers: { 'X-Client-IP': request.headers.get('CF-Connecting-IP') || '', 'X-Carrier-Mode': mode } }));
   if (!issued.ok) return hidden(env);
-  return bridgeResponse(env.PUBLIC_HOSTNAME, token);
+  return bridgeResponse(env.PUBLIC_HOSTNAME, token, mode);
 }
 
 async function createSession(request: Request, env: Env): Promise<Response> {
@@ -363,16 +464,19 @@ async function deleteSession(request: Request, env: Env): Promise<Response> {
 async function websocket(request: Request, env: Env): Promise<Response> {
   if (request.headers.get('Upgrade')?.toLowerCase() !== 'websocket') return hidden(env);
   const protocol = request.headers.get('Sec-WebSocket-Protocol') || '';
-  const match = /^tproxy-v1\.([A-Za-z0-9_-]{43})$/.exec(protocol);
-  if (!match) return hidden(env);
-  const token = match[1]!;
+  const lane = parseLaneProtocol(protocol);
+  const match = lane ? null : /^tproxy-v1\.([A-Za-z0-9_-]{43})$/.exec(protocol);
+  const token = lane?.token ?? match?.[1];
+  if (!token) return hidden(env);
   const session = sessionStub(env, token);
-  const response = await session.fetch(internalRequest('/ws', token, { headers: { Upgrade: 'websocket' } }));
+  const headers: Record<string, string> = { Upgrade: 'websocket' };
+  if (lane) headers['X-Lane-Id'] = String(lane.streamId);
+  const response = await session.fetch(internalRequest('/ws', token, { headers }));
   if (response.status !== 101) return hidden(env);
-  const headers = new Headers(response.headers);
-  headers.set('Sec-WebSocket-Protocol', protocol);
-  headers.set('Sec-WebSocket-Extensions', '');
-  return new Response(null, { status: 101, webSocket: response.webSocket, headers });
+  const upgraded = new Headers(response.headers);
+  upgraded.set('Sec-WebSocket-Protocol', protocol);
+  upgraded.set('Sec-WebSocket-Extensions', '');
+  return new Response(null, { status: 101, webSocket: response.webSocket, headers: upgraded });
 }
 
 export default {

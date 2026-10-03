@@ -394,6 +394,11 @@ export class RelayCore {
     } finally { if (timer) clearTimeout(timer); }
   }
 
+  /** Close one backend stream without notifying the carrier (its lane socket is already gone). */
+  abortStream(id: number): void { this.#closeStream(id, false); }
+
+  hasStream(id: number): boolean { return this.#streams.has(id); }
+
   close(): void {
     if (this.#ended) return;
     this.#ended = true;

@@ -3,6 +3,7 @@ declare namespace Cloudflare {
     WEB_SECRET: string;
     PUBLIC_HOSTNAME: string;
     PUBLIC_SITE_TITLE?: string;
+    CARRIER_MODE?: string;
     BOOTSTRAPS: DurableObjectNamespace;
     SESSIONS: DurableObjectNamespace;
   }
