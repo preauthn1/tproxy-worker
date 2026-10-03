@@ -1,5 +1,5 @@
 import { bridgeResponse } from './bridge';
-import { decodeSecret, deriveCapability, randomToken, validateHostname, validToken } from './capability';
+import { decodeSecret, deriveCapability, validateHostname, validToken } from './capability';
 import { FrameType, encodeFrame, parseHello } from './frame';
 import { DEFAULT_LIMITS } from './limits';
 import { publicResponse } from './public-site';
@@ -8,6 +8,7 @@ import { TelegramConnector } from './mtproxy';
 import { CloudflareTelegramDialer } from './tcp';
 import { DEFAULT_WEBSOCKET_BATCHER_OPTIONS, WebSocketBatcher } from './ws-batcher';
 import { IdleLiveness, SerializedInboundQueue, readBoundedBody } from './session-guards';
+import { isRegion, regionFor, regionalToken, registryStub, tokenRegion } from './region';
 
 interface BootstrapEntry {
   expiresAt: number;
@@ -24,6 +25,7 @@ interface SessionConfig {
 }
 
 const INTERNAL_AUTH = 'X-Tproxy-Internal-Token';
+const INTERNAL_REGION = 'X-Tproxy-Region';
 const BOOTSTRAP_TTL_MS = 2 * 60 * 1000;
 const SESSION_TTL_MS = 6 * 60 * 60 * 1000;
 const CREATE_BODY_LIMIT = 64;
@@ -166,8 +168,10 @@ export class BootstrapRegistry {
         if (entry.bodyDigest !== digest || !entry.sessionToken) return new Response(null, { status: 404 });
         return this.#created(entry.sessionToken);
       }
-      const sessionToken = randomToken();
-      const session = this.#env.SESSIONS.get(this.#env.SESSIONS.idFromName(sessionToken));
+      const regionHeader = request.headers.get(INTERNAL_REGION);
+      const region = isRegion(regionHeader) ? regionHeader : undefined;
+      const sessionToken = regionalToken(region);
+      const session = sessionStub(this.#env, sessionToken);
       const initialized = await session.fetch(internalRequest('/init', sessionToken, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -270,11 +274,13 @@ export class RelaySession {
       server.addEventListener('message', (event) => {
         this.#liveness?.touch();
         if (typeof event.data === 'string') { void this.#close(1003, 'binary messages required'); return; }
-        const bytes = event.data instanceof ArrayBuffer
-          ? new Uint8Array(event.data)
+        // An ArrayBuffer delivered by the event is already exclusively owned; only views need a copy.
+        const owned = event.data instanceof ArrayBuffer;
+        const bytes = owned
+          ? new Uint8Array(event.data as ArrayBuffer)
           : ArrayBuffer.isView(event.data) ? new Uint8Array(event.data.buffer, event.data.byteOffset, event.data.byteLength) : null;
         if (!bytes || bytes.byteLength === 0 || bytes.byteLength > DEFAULT_LIMITS.maxCarrierBatchBytes) { void this.#close(1009, 'message limit'); return; }
-        if (!this.#queue?.push(bytes.slice())) void this.#close(1009, 'message queue limit');
+        if (!this.#queue?.push(owned ? bytes : bytes.slice())) void this.#close(1009, 'message queue limit');
       });
       server.addEventListener('close', () => { void this.#close(); });
       server.addEventListener('error', () => { void this.#close(); });
@@ -306,9 +312,16 @@ export class RelaySession {
   async alarm(): Promise<void> { await this.#close(1001, 'session expired'); }
 }
 
+function sessionStub(env: Env, token: string): DurableObjectStub {
+  const region = tokenRegion(token);
+  const id = env.SESSIONS.idFromName(token);
+  return region ? env.SESSIONS.get(id, { locationHint: region }) : env.SESSIONS.get(id);
+}
+
 async function issueBridge(request: Request, env: Env): Promise<Response> {
-  const token = randomToken();
-  const registry = env.BOOTSTRAPS.get(env.BOOTSTRAPS.idFromName('global'));
+  const region = regionFor(request.cf as Parameters<typeof regionFor>[0]);
+  const token = regionalToken(region);
+  const registry = registryStub(env.BOOTSTRAPS, region);
   const issued = await registry.fetch(internalRequest('/issue', token, { method: 'POST', headers: { 'X-Client-IP': request.headers.get('CF-Connecting-IP') || '' } }));
   if (!issued.ok) return hidden(env);
   return bridgeResponse(env.PUBLIC_HOSTNAME, token);
@@ -318,7 +331,8 @@ async function createSession(request: Request, env: Env): Promise<Response> {
   if (request.headers.has('Cookie') || request.headers.get('Content-Type') !== 'application/octet-stream') return hidden(env);
   const token = bearer(request);
   if (!token) return hidden(env);
-  const registry = env.BOOTSTRAPS.get(env.BOOTSTRAPS.idFromName('global'));
+  const region = tokenRegion(token);
+  const registry = registryStub(env.BOOTSTRAPS, region);
   const lookup = await registry.fetch(internalRequest('/lookup', token, { method: 'POST' }));
   if (!lookup.ok) return hidden(env);
   const contentLength = request.headers.get('Content-Length');
@@ -328,7 +342,10 @@ async function createSession(request: Request, env: Env): Promise<Response> {
   catch { return hidden(env); }
   const created = await registry.fetch(internalRequest('/create', token, {
     method: 'POST', body: Uint8Array.from(body).buffer,
-    headers: { 'Content-Type': 'application/octet-stream', 'X-Client-IP': request.headers.get('CF-Connecting-IP') || '' }
+    headers: {
+      'Content-Type': 'application/octet-stream', 'X-Client-IP': request.headers.get('CF-Connecting-IP') || '',
+      ...(region ? { [INTERNAL_REGION]: region } : {})
+    }
   }));
   if (created.status === 404 || created.status === 400) return hidden(env);
   return created;
@@ -338,7 +355,7 @@ async function deleteSession(request: Request, env: Env): Promise<Response> {
   if (request.headers.has('Cookie')) return hidden(env);
   const token = bearer(request);
   if (!token) return hidden(env);
-  const session = env.SESSIONS.get(env.SESSIONS.idFromName(token));
+  const session = sessionStub(env, token);
   const response = await session.fetch(internalRequest('/close', token, { method: 'DELETE' }));
   return response.status === 204 ? response : hidden(env);
 }
@@ -349,7 +366,7 @@ async function websocket(request: Request, env: Env): Promise<Response> {
   const match = /^tproxy-v1\.([A-Za-z0-9_-]{43})$/.exec(protocol);
   if (!match) return hidden(env);
   const token = match[1]!;
-  const session = env.SESSIONS.get(env.SESSIONS.idFromName(token));
+  const session = sessionStub(env, token);
   const response = await session.fetch(internalRequest('/ws', token, { headers: { Upgrade: 'websocket' } }));
   if (response.status !== 101) return hidden(env);
   const headers = new Headers(response.headers);

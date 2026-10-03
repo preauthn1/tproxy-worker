@@ -1,14 +1,22 @@
 /* SPDX-License-Identifier: GPL-3.0-only */
 
+/** Minimum keystream generated per WebCrypto call; amortizes per-call overhead for small chunks. */
+export const KEYSTREAM_PREFETCH_BYTES = 16 * 1024;
+
 /**
- * Streaming AES-256-CTR with explicit 128-bit counter and partial-block state.
+ * Streaming AES-256-CTR with explicit 128-bit counter and keystream state.
  * WebCrypto is used only to generate whole AES-CTR keystream blocks; this class
  * owns counter advancement so calls of any size are byte-identical to one call.
+ * Keystream is generated ahead in at least KEYSTREAM_PREFETCH_BYTES so a stream
+ * of small MTProto packets costs one WebCrypto round trip per prefetch window
+ * instead of one per packet. The keystream depends only on key and position, so
+ * prefetching does not change any output byte.
  */
 export class StreamingAes256Ctr {
   readonly #key: CryptoKey;
   readonly #counter: Uint8Array;
-  #remaining = new Uint8Array();
+  #keystream = new Uint8Array();
+  #keystreamOffset = 0;
   #closed = false;
 
   private constructor(key: CryptoKey, counter: Uint8Array) {
@@ -30,28 +38,16 @@ export class StreamingAes256Ctr {
     if (this.#closed) throw new Error('AES-CTR state is closed');
     const output = new Uint8Array(input.byteLength);
     let offset = 0;
-    if (this.#remaining.byteLength) {
-      const length = Math.min(input.byteLength, this.#remaining.byteLength);
-      for (let index = 0; index < length; index++) output[index] = input[index]! ^ this.#remaining[index]!;
-      const previous = this.#remaining;
-      this.#remaining = previous.slice(length);
-      previous.fill(0);
-      offset = length;
+    while (offset < input.byteLength) {
+      if (this.#keystreamOffset === this.#keystream.byteLength) {
+        await this.#refill(input.byteLength - offset);
+        if (this.#closed) throw new Error('AES-CTR state is closed');
+      }
+      const length = Math.min(input.byteLength - offset, this.#keystream.byteLength - this.#keystreamOffset);
+      xorInto(output, offset, input, offset, this.#keystream, this.#keystreamOffset, length);
+      this.#keystreamOffset += length;
+      offset += length;
     }
-    const needed = input.byteLength - offset;
-    if (!needed) return output;
-    const blocks = Math.ceil(needed / 16);
-    const zeros = new Uint8Array(blocks * 16);
-    const stream = new Uint8Array(await crypto.subtle.encrypt(
-      { name: 'AES-CTR', counter: this.#counter.slice(), length: 128 },
-      this.#key,
-      zeros
-    ));
-    zeros.fill(0);
-    this.#increment(blocks);
-    for (let index = 0; index < needed; index++) output[offset + index] = input[offset + index]! ^ stream[index]!;
-    if (stream.byteLength > needed) this.#remaining = stream.slice(needed);
-    stream.fill(0);
     return output;
   }
 
@@ -59,16 +55,58 @@ export class StreamingAes256Ctr {
     if (this.#closed) return;
     this.#closed = true;
     this.#counter.fill(0);
-    this.#remaining.fill(0);
-    this.#remaining = new Uint8Array();
+    this.#keystream.fill(0);
+    this.#keystream = new Uint8Array();
+    this.#keystreamOffset = 0;
+  }
+
+  async #refill(needed: number): Promise<void> {
+    this.#keystream.fill(0);
+    const blocks = Math.ceil(Math.max(needed, KEYSTREAM_PREFETCH_BYTES) / 16);
+    const zeros = new Uint8Array(blocks * 16);
+    const counter = this.#counter.slice();
+    // Advance before awaiting so state stays consistent even if a caller races.
+    this.#increment(blocks);
+    this.#keystream = new Uint8Array(await crypto.subtle.encrypt(
+      { name: 'AES-CTR', counter, length: 128 },
+      this.#key,
+      zeros
+    ));
+    this.#keystreamOffset = 0;
+    counter.fill(0);
   }
 
   #increment(blocks: number): void {
-    for (let block = 0; block < blocks; block++) {
-      for (let index = 15; index >= 0; index--) {
-        this.#counter[index] = (this.#counter[index]! + 1) & 0xff;
-        if (this.#counter[index] !== 0) break;
-      }
+    // Add `blocks` to the big-endian 128-bit counter in one pass.
+    let carry = blocks;
+    for (let index = 15; index >= 0 && carry > 0; index--) {
+      const sum = this.#counter[index]! + (carry % 256);
+      this.#counter[index] = sum & 0xff;
+      carry = Math.floor(carry / 256) + (sum >> 8);
     }
+  }
+}
+
+function xorInto(
+  output: Uint8Array, outputOffset: number,
+  input: Uint8Array, inputOffset: number,
+  stream: Uint8Array, streamOffset: number,
+  length: number
+): void {
+  let index = 0;
+  const outAddress = output.byteOffset + outputOffset;
+  const inAddress = input.byteOffset + inputOffset;
+  const streamAddress = stream.byteOffset + streamOffset;
+  // Word-wise XOR when all three views share 4-byte alignment.
+  if (length >= 64 && (outAddress & 3) === 0 && (inAddress & 3) === 0 && (streamAddress & 3) === 0) {
+    const words = length >>> 2;
+    const out32 = new Uint32Array(output.buffer, outAddress, words);
+    const in32 = new Uint32Array(input.buffer, inAddress, words);
+    const ks32 = new Uint32Array(stream.buffer, streamAddress, words);
+    for (let word = 0; word < words; word++) out32[word] = in32[word]! ^ ks32[word]!;
+    index = words << 2;
+  }
+  for (; index < length; index++) {
+    output[outputOffset + index] = input[inputOffset + index]! ^ stream[streamOffset + index]!;
   }
 }

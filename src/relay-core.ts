@@ -189,7 +189,9 @@ export class RelayCore {
             collector = new GrainCollector(RELAY_DATA_CHUNK);
             uploads.set(frame.streamId, collector);
           }
-          collector.push(frame.payload.slice());
+          // The carrier batch is exclusively owned. Large payloads are kept as views
+          // (no copy); small ones are copied so they do not pin the whole batch.
+          collector.push(frame.payload.byteLength >= RELAY_DATA_CHUNK / 2 ? frame.payload : frame.payload.slice());
         } else if (frame.type === FrameType.Window) {
           const stream = this.#streams.get(frame.streamId);
           if (stream) {
