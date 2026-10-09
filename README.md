@@ -4,6 +4,18 @@
 
 The implemented carrier is multiplexed `carrier_mode=websocket`. The repository includes no account ID, route, custom domain, or secret; deployments must provide those externally.
 
+## 2026-10 更新：默认 websocket-lanes + 无 DO lanes
+
+- `CARRIER_MODE` 默认 `websocket-lanes`；设为 `websocket` 回退单连接复用。
+- lanes 默认不经 Durable Object：每条 lane 是一次独立 Worker 调用，持有一条 Telegram 流（obfuscated2 终止、TCP 直连 + WSS 兜底、信用背压、每 lane 8 MiB/1024 上限不变）。`LANES_BACKEND=durable` 恢复按会话 DO。
+- 无状态 bootstrap/session token：HMAC-SHA256，绑定 Host 与类型；bootstrap 2 分钟，session 24 小时。默认由 `WEB_SECRET` 派生，可设 `TOKEN_SECRET` 独立轮换。
+- 多域名：capability/bridge/token 绑定请求 Host。`PUBLIC_HOSTNAME`/`PUBLIC_HOSTNAMES`（逗号分隔）为白名单；都不设或 `ALLOW_ANY_HOST=1` 时接受任意域名（仍需该域名的 capability）。
+- `/api/v1/*` 带 `Origin` 时必须同源。
+- WSS 兜底顺序：`kws{N}[-1].web.telegram.org` → 旧行星名 → 另一 media 变体；`WSS_FALLBACK=0` 关闭，`force` 只走 WSS。
+- `HEALTH_PATH`（建议随机路径）开启健康检查；`DIAGNOSTICS=1` 输出结构化事件。
+- `wrangler.jsonc` 设 `limits.cpu_ms=300000`（需 Workers Paid）。
+- 轻量校验：`npx tsx scripts/verify-stateless.mts`、`scripts/verify-lanes.mts`、`scripts/bridge-*-sim.mjs`、`scripts/e2e.mts`。
+
 ## 架构
 
 ```text
