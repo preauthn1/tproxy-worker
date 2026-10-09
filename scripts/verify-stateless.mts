@@ -38,7 +38,8 @@ ok(JSON.stringify(telegramWssHosts(2)) === JSON.stringify(['kws2.web.telegram.or
 ok(JSON.stringify(telegramWssHosts(-4)) === JSON.stringify(['kws4-1.web.telegram.org', 'vesta-1.web.telegram.org', 'kws4.web.telegram.org']), 'WSS hosts media DC4');
 
 const e = (v: Record<string, string>) => ({ ...v });
-ok(carrierModeOf(e({})) === 'websocket-lanes' && statelessLanes(e({})), 'default = websocket-lanes, stateless backend');
+ok(carrierModeOf(e({})) === 'websocket-lanes' && !statelessLanes(e({})), 'default = websocket-lanes on Durable Object backend');
+ok(statelessLanes(e({ LANES_BACKEND: 'stateless' })), 'LANES_BACKEND=stateless opts into DO-free lanes');
 ok(carrierModeOf(e({ CARRIER_MODE: 'websocket' })) === 'websocket' && !statelessLanes(e({ CARRIER_MODE: 'websocket' })), 'CARRIER_MODE=websocket fallback');
-ok(!statelessLanes(e({ LANES_BACKEND: 'durable' })), 'LANES_BACKEND=durable keeps DO lanes');
+ok(!statelessLanes(e({ CARRIER_MODE: 'websocket', LANES_BACKEND: 'stateless' })), 'stateless only applies to lanes');
 console.log('ALL STATELESS CHECKS PASSED');

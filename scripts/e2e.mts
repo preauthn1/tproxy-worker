@@ -10,6 +10,8 @@ const [rawOrigin, secretText, streamsText] = process.argv.slice(2);
 if (!rawOrigin || !secretText) { console.error('usage: e2e.mts <origin> <secret> [streams]'); process.exit(2); }
 const origin = new URL(rawOrigin);
 const streams = Number(streamsText || 3);
+const DC = Number(process.env.DC || 2);
+const HOLD_MS = Number(process.env.HOLD_MS || 0); // keep lanes open and re-probe periodically
 const secret = decodeSecret(secretText);
 const mtSecret = secret.byteLength === 17 ? secret.slice(1) : secret.slice(0, 16);
 
@@ -31,7 +33,7 @@ class Ctr {
   }
 }
 
-// One obfuscated2 client toward DC2 using intermediate (0xeeeeeeee) transport.
+// One obfuscated2 client toward DC (env DC, default 2) using intermediate (0xeeeeeeee) transport.
 async function makeClient() {
   let header: Uint8Array;
   for (;;) {
@@ -39,7 +41,7 @@ async function makeClient() {
     const v = new DataView(header.buffer);
     const first = v.getUint32(0, true), second = v.getUint32(4, true);
     if (header[0] === 0xef || [0x44414548, 0x54534f50, 0x20544547, 0x4954504f, 0xeeeeeeee, 0xdddddddd, 0x02010316].includes(first) || second === 0) continue;
-    v.setUint32(56, 0xeeeeeeee, true); v.setInt16(60, 2, true); break;
+    v.setUint32(56, 0xeeeeeeee, true); v.setInt16(60, DC, true); break;
   }
   const enc = new Ctr(await sha256(header.slice(8, 40), mtSecret), header.slice(40, 56));
   const rev = Uint8Array.from(header.slice(8, 56)).reverse();
@@ -52,7 +54,14 @@ async function makeClient() {
   const msg = new Uint8Array(20 + body.length); const mv = new DataView(msg.buffer);
   mv.setBigUint64(8, BigInt(Math.floor(Date.now() / 1000)) << 32n, true); mv.setUint32(16, body.length, true); msg.set(body, 20);
   const packet = new Uint8Array(4 + msg.length); new DataView(packet.buffer).setUint32(0, msg.length, true); packet.set(msg, 4);
-  return { first: concat(wire, await enc.apply(packet)), dec, nonce };
+  return { first: concat(wire, await enc.apply(packet)), enc, dec, nonce, packet: async () => {
+    const n = webcrypto.getRandomValues(new Uint8Array(16));
+    const b = new Uint8Array(20); new DataView(b.buffer).setUint32(0, 0xbe7e8ef1, true); b.set(n, 4);
+    const m = new Uint8Array(40); const v2 = new DataView(m.buffer);
+    v2.setBigUint64(8, BigInt(Math.floor(Date.now() / 1000)) << 32n, true); v2.setUint32(16, 20, true); m.set(b, 20);
+    const p = new Uint8Array(44); new DataView(p.buffer).setUint32(0, 40, true); p.set(m, 4);
+    return enc.apply(p);
+  } };
 }
 
 const capability = await deriveCapability(origin.hostname, secret);
@@ -78,28 +87,46 @@ function openSocket(protocol: string): Promise<WebSocket> {
   });
 }
 
+const holds: Promise<void>[] = [];
 async function runStream(id: number, ws: WebSocket, shared: boolean) {
   const c = await makeClient();
+  let probes = 0; let want = 1; let onProbe: (() => void) | undefined;
   const start = performance.now();
   const done = new Promise<number>((resolve, reject) => {
     let buf = new Uint8Array();
     const timer = setTimeout(() => reject(new Error(`stream ${id} timeout`)), 20000);
+    ws.addEventListener('close', (event) => { if (HOLD_MS > 0) console.log(ms(), `stream ${id} socket closed code=${(event as CloseEvent).code} after ${probes} probes`); });
     ws.addEventListener('message', async (event) => {
       for (const f of parseRelayBatch(new Uint8Array(event.data as ArrayBuffer))) {
         if (f.streamId !== id) { if (!shared) reject(new Error('cross-lane frame')); continue; }
-        if (f.type === FrameType.Close) { clearTimeout(timer); reject(new Error(`stream ${id} closed by relay`)); return; }
+        if (f.type === FrameType.Close) { clearTimeout(timer); if (probes > 0) console.log(ms(), `stream ${id} CLOSE from relay after ${probes} probes`); reject(new Error(`stream ${id} closed by relay`)); return; }
         if (f.type !== FrameType.Data) continue;
         buf = concat(buf, await c.dec.apply(f.payload));
-        if (buf.length >= 4 + 20 + 4) {
-          const ctor = new DataView(buf.buffer).getUint32(4 + 20, true);
-          clearTimeout(timer);
-          if (ctor !== 0x05162463) reject(new Error(`stream ${id} unexpected ctor ${ctor.toString(16)}`));
-          else resolve(performance.now() - start);
+        while (buf.length >= 4) {
+          const len = new DataView(buf.buffer, buf.byteOffset).getUint32(0, true);
+          if (buf.length < 4 + len) break;
+          const ctor = new DataView(buf.buffer, buf.byteOffset).getUint32(4 + 20, true);
+          buf = buf.slice(4 + len);
+          if (ctor !== 0x05162463) { reject(new Error(`stream ${id} unexpected ctor ${ctor.toString(16)}`)); return; }
+          probes++;
+          if (probes === 1) { clearTimeout(timer); resolve(performance.now() - start); }
+          else onProbe?.();
         }
       }
     });
   });
   ws.send(concat(encodeFrame(FrameType.Open, id), encodeFrame(FrameType.Data, id, c.first)));
+  if (HOLD_MS > 0) holds.push(done.then(async () => {
+    const until = Date.now() + HOLD_MS;
+    while (Date.now() < until) {
+      await new Promise((r) => setTimeout(r, Math.min(30_000, until - Date.now())));
+      if (Date.now() >= until) break;
+      want++;
+      const got = new Promise<void>((resolve, reject) => { const t = setTimeout(() => reject(new Error(`stream ${id} re-probe ${want} timeout`)), 20_000); onProbe = () => { if (probes >= want) { clearTimeout(t); resolve(); } }; });
+      ws.send(encodeFrame(FrameType.Data, id, await c.packet()));
+      await got;
+    }
+  }));
   return done;
 }
 
@@ -108,6 +135,14 @@ if (mode === 'websocket-lanes') {
   const sockets = await Promise.all(Array.from({ length: streams }, (_, i) => openSocket(`tproxy-lane-v1.${token}.${i + 1}`)));
   console.log(ms(), streams, 'lane sockets open');
   results.push(...await Promise.all(sockets.map((ws, i) => runStream(i + 1, ws, false))));
+  if (HOLD_MS > 0) {
+    console.log(ms(), `holding ${streams} lanes for ${HOLD_MS}ms with 30s re-probes`);
+    await Promise.all(holds);
+    // a brand-new lane after the hold proves the session token outlives the peer's 5-minute cliff
+    const late = await openSocket(`tproxy-lane-v1.${token}.${streams + 1}`);
+    console.log(ms(), 'late lane after hold: resPQ in', (await runStream(streams + 1, late, false)).toFixed(0), 'ms');
+    late.close();
+  }
   for (const ws of sockets) ws.close();
 } else {
   const ws = await openSocket(`tproxy-v1.${token}`);
@@ -115,7 +150,7 @@ if (mode === 'websocket-lanes') {
   results.push(...await Promise.all(Array.from({ length: streams }, (_, i) => runStream(i + 1, ws, true))));
   ws.close();
 }
-console.log(ms(), 'resPQ from Telegram DC2 on', results.length, 'streams; RTT ms:', results.map((x) => x.toFixed(0)).join(', '));
+console.log(ms(), `resPQ from Telegram DC${DC} on`, results.length, 'streams; RTT ms:', results.map((x) => x.toFixed(0)).join(', '));
 await fetch(new URL('/api/v1/session', origin), { method: 'DELETE', headers: { Authorization: `Bearer ${token}` } });
 console.log('E2E OK');
 process.exit(0);

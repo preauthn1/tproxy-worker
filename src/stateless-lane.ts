@@ -145,7 +145,8 @@ export function statelessLane(env: LaneEnv, token: string, expiresAt: number, st
     if (!bytes || bytes.byteLength === 0 || bytes.byteLength > DEFAULT_LIMITS.maxCarrierBatchBytes) { shutdown(1009, 'message limit'); return; }
     if (!queue.push(owned ? bytes : bytes.slice())) shutdown(1009, 'lane queue limit');
   });
-  server.addEventListener('close', () => shutdown(1000, 'peer_close'));
+  // Close our end explicitly so the invocation can finish (avoids the runtime's "hung" cancellation).
+  server.addEventListener('close', (event) => { shutdown(1000, 'peer_close'); try { server.close((event as CloseEvent).code === 1005 ? 1000 : (event as CloseEvent).code || 1000, 'closed'); } catch { /* already closed */ } });
   server.addEventListener('error', (event) => { diag('lane_error', { backend: 'stateless', stream: streamId, error: errorKind((event as ErrorEvent).error) }); shutdown(1011, 'socket error'); });
   diag('lane_open', { backend: 'stateless', stream: streamId, active: entry.active.size });
   return new Response(null, { status: 101, webSocket: client, headers: { 'Sec-WebSocket-Protocol': protocol, 'Sec-WebSocket-Extensions': '' } });

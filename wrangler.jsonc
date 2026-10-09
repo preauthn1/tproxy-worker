@@ -20,6 +20,5 @@
   "vars": {
     "PUBLIC_SITE_TITLE": "Public Site"
   },
-  "limits": { "cpu_ms": 300000 },
   "observability": { "enabled": true }
 }

@@ -6,5 +6,9 @@ interface CarrierEnv { CARRIER_MODE?: string | undefined; LANES_BACKEND?: string
 /** websocket-lanes is the default; set CARRIER_MODE=websocket to fall back to the single multiplexed carrier. */
 export function carrierModeOf(env: CarrierEnv): CarrierMode { return env.CARRIER_MODE === 'websocket' ? 'websocket' : 'websocket-lanes'; }
 
-/** Lanes run Durable-Object-free by default; LANES_BACKEND=durable restores the per-session Durable Object. */
-export function statelessLanes(env: CarrierEnv): boolean { return carrierModeOf(env) === 'websocket-lanes' && env.LANES_BACKEND !== 'durable'; }
+/**
+ * Lanes use the per-session Durable Object by default. LANES_BACKEND=stateless runs each lane as a
+ * plain Worker invocation (no DO). Measured 2026-10 on a Workers Free account: stateless lanes were
+ * load-shed after 60-180 s while DO lanes held >5 min, so stateless is opt-in and needs Workers Paid.
+ */
+export function statelessLanes(env: CarrierEnv): boolean { return carrierModeOf(env) === 'websocket-lanes' && env.LANES_BACKEND === 'stateless'; }
