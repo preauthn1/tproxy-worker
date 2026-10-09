@@ -43,3 +43,8 @@ ok(statelessLanes(e({ LANES_BACKEND: 'stateless' })), 'LANES_BACKEND=stateless o
 ok(carrierModeOf(e({ CARRIER_MODE: 'websocket' })) === 'websocket' && !statelessLanes(e({ CARRIER_MODE: 'websocket' })), 'CARRIER_MODE=websocket fallback');
 ok(!statelessLanes(e({ CARRIER_MODE: 'websocket', LANES_BACKEND: 'stateless' })), 'stateless only applies to lanes');
 console.log('ALL STATELESS CHECKS PASSED');
+const { regionFor } = await import('../src/region');
+ok(regionFor({ colo: 'FRA', country: 'CN', continent: 'AS' }) === 'weur', 'CN client entering FRA -> weur DO');
+ok(regionFor({ colo: 'HKG', country: 'CN', continent: 'AS' }) === 'apac', 'CN client entering HKG -> apac DO');
+ok(regionFor({ colo: 'XXX', country: 'CN', continent: 'AS' }) === 'apac', 'unknown colo falls back to geo');
+console.log('REGION CHECKS PASSED');

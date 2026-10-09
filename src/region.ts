@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: GPL-3.0-only */
 import { randomToken } from './capability';
+import { regionForColo } from './colo-region';
 
 /**
  * Durable Object placement. A Durable Object is created near the first caller
@@ -19,10 +20,13 @@ const GLOBAL_CHAR = 'G';
 const MIDDLE_EAST = new Set(['AE', 'BH', 'IL', 'IQ', 'IR', 'JO', 'KW', 'LB', 'OM', 'PS', 'QA', 'SA', 'SY', 'TR', 'YE']);
 const EASTERN_EUROPE = new Set(['BG', 'BY', 'CZ', 'EE', 'FI', 'HU', 'LT', 'LV', 'MD', 'PL', 'RO', 'RU', 'SK', 'UA', 'GR', 'RS', 'HR', 'SI', 'BA', 'MK', 'AL', 'ME', 'CY']);
 
-interface CfLike { continent?: unknown; country?: unknown; longitude?: unknown }
+interface CfLike { colo?: unknown; continent?: unknown; country?: unknown; longitude?: unknown }
 
 export function regionFor(cf: CfLike | undefined | null): Region | undefined {
   if (!cf) return undefined;
+  // Entry colo wins over client geography (see colo-region.ts).
+  const byColo = regionForColo(cf.colo);
+  if (byColo) return byColo;
   const continent = typeof cf.continent === 'string' ? cf.continent : '';
   const country = typeof cf.country === 'string' ? cf.country : '';
   if (MIDDLE_EAST.has(country)) return 'me';
