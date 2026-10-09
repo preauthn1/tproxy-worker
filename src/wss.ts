@@ -11,6 +11,18 @@ export function telegramWssHost(signedDc: number): string {
   return `${name}${signedDc < 0 ? '-1' : ''}.web.telegram.org`;
 }
 
+/**
+ * Ordered Telegram Web WSS front doors for a signed DC: the Web K `kws{N}[-1]`
+ * names (as used by ToiCF/CF-Workers-TGProxy), the legacy planet names, then the
+ * opposite media variant of `kws{N}`.
+ */
+export function telegramWssHosts(signedDc: number): string[] {
+  const legacy = telegramWssHost(signedDc);
+  const dc = Math.abs(signedDc);
+  const media = signedDc < 0;
+  return [`kws${dc}${media ? '-1' : ''}.web.telegram.org`, legacy, `kws${dc}${media ? '' : '-1'}.web.telegram.org`];
+}
+
 function validInit(init: Uint8Array): boolean {
   if (init[0] === 0xef) return false;
   const view = new DataView(init.buffer, init.byteOffset, init.byteLength);
@@ -111,13 +123,25 @@ class WssTelegramConnection implements DirectTelegramConnection {
 }
 
 export interface WssDialOptions {
+  /** Per-host upgrade timeout. */
   timeoutMs: number;
   signal?: AbortSignal | undefined;
   fetchImpl?: typeof fetch;
+  hosts?: readonly string[];
 }
 
 export async function dialTelegramWss(signedDc: number, tag: number, options: WssDialOptions): Promise<DirectTelegramConnection> {
-  const host = telegramWssHost(signedDc);
+  const hosts = options.hosts ?? telegramWssHosts(signedDc);
+  let lastError: unknown;
+  for (const host of hosts) {
+    if (options.signal?.aborted) throw new Error('Telegram WSS dial cancelled');
+    try { return await dialTelegramWssHost(host, signedDc, tag, options); }
+    catch (error) { lastError = error; }
+  }
+  throw lastError instanceof Error ? lastError : new Error('Telegram WSS dial failed');
+}
+
+async function dialTelegramWssHost(host: string, signedDc: number, tag: number, options: WssDialOptions): Promise<DirectTelegramConnection> {
   const controller = new AbortController();
   const onAbort = () => controller.abort();
   options.signal?.addEventListener('abort', onAbort, { once: true });

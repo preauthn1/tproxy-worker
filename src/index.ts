@@ -1,5 +1,5 @@
 import { bridgeResponse } from './bridge';
-import { decodeSecret, deriveCapability, validateHostname, validToken } from './capability';
+import { decodeSecret, deriveCapability, validToken } from './capability';
 import { FrameType, encodeFrame, parseHello } from './frame';
 import { DEFAULT_LIMITS } from './limits';
 import { publicResponse } from './public-site';
@@ -9,13 +9,16 @@ import { CloudflareTelegramDialer } from './tcp';
 import { DialLimiter } from './dial-limiter';
 import { dialTelegramWss } from './wss';
 import { configureDiagnostics, diag } from './diag';
+import { sameOrigin, servedHost } from './hosts';
+import { STATELESS_BOOTSTRAP_TTL_MS, STATELESS_SESSION_TTL_MS, mintToken, tokenKey, verifyToken } from './tokens';
+import { consumeBootstrap, revokeStatelessSession, statelessLane } from './stateless-lane';
 import { DEFAULT_WEBSOCKET_BATCHER_OPTIONS, WebSocketBatcher } from './ws-batcher';
 import { IdleLiveness, SerializedInboundQueue, readBoundedBody } from './session-guards';
 import { isRegion, regionFor, regionalToken, registryStub, tokenRegion } from './region';
 import { LANE_MAX_PENDING_BYTES, LANE_MAX_PENDING_ITEMS, LaneOverflow, LaneRouter, parseLaneProtocol, validateLaneMessage } from './lanes';
 
-export type CarrierMode = 'websocket' | 'websocket-lanes';
-export function carrierModeOf(env: Env): CarrierMode { return env.CARRIER_MODE === 'websocket-lanes' ? 'websocket-lanes' : 'websocket'; }
+import { carrierModeOf, statelessLanes, type CarrierMode } from './carrier';
+export { carrierModeOf, statelessLanes, type CarrierMode };
 
 interface BootstrapEntry {
   expiresAt: number;
@@ -324,7 +327,7 @@ export class RelaySession {
           dialTimeoutMs: 5_000,
           limiter: new DialLimiter(8, 256),
           fallbackOnly: this.#env.WSS_FALLBACK === 'force',
-          fallback: this.#env.WSS_FALLBACK === '0' ? undefined : (dc, tag, signal) => dialTelegramWss(dc, tag, { timeoutMs: 10_000, signal })
+          fallback: this.#env.WSS_FALLBACK === '0' ? undefined : (dc, tag, signal) => dialTelegramWss(dc, tag, { timeoutMs: 5_000, signal })
         }),
         send,
         closeCarrier: () => { void this.#close(); }
@@ -452,21 +455,49 @@ function sessionStub(env: Env, token: string): DurableObjectStub {
   return region ? env.SESSIONS.get(id, { locationHint: region }) : env.SESSIONS.get(id);
 }
 
-async function issueBridge(request: Request, env: Env): Promise<Response> {
-  diag('bridge_issued', { colo: (request.cf as { colo?: string } | undefined)?.colo, mode: carrierModeOf(env) });
+async function issueBridge(request: Request, env: Env, host: string): Promise<Response> {
+  diag('bridge_issued', { colo: (request.cf as { colo?: string } | undefined)?.colo, mode: carrierModeOf(env), backend: statelessLanes(env) ? 'stateless' : 'durable' });
+  if (statelessLanes(env)) {
+    const bootstrap = await mintToken(await tokenKey(env), 'bootstrap', host, STATELESS_BOOTSTRAP_TTL_MS);
+    return bridgeResponse(host, bootstrap, 'websocket-lanes');
+  }
   const region = regionFor(request.cf as Parameters<typeof regionFor>[0]);
   const token = regionalToken(region);
   const registry = registryStub(env.BOOTSTRAPS, region);
   const mode = carrierModeOf(env);
   const issued = await registry.fetch(internalRequest('/issue', token, { method: 'POST', headers: { 'X-Client-IP': request.headers.get('CF-Connecting-IP') || '', 'X-Carrier-Mode': mode } }));
   if (!issued.ok) return hidden(env);
-  return bridgeResponse(env.PUBLIC_HOSTNAME, token, mode);
+  return bridgeResponse(host, token, mode);
 }
 
-async function createSession(request: Request, env: Env): Promise<Response> {
+async function createStatelessSession(request: Request, env: Env, host: string, token: string): Promise<Response | null> {
+  const key = await tokenKey(env);
+  const expiresAt = await verifyToken(key, 'bootstrap', host, token);
+  if (expiresAt === null) return null;
+  const contentLength = request.headers.get('Content-Length');
+  if (contentLength && (!/^(0|[1-9][0-9]*)$/.test(contentLength) || Number(contentLength) > CREATE_BODY_LIMIT)) return hidden(env);
+  try { parseHello(await readBoundedBody(request.body, CREATE_BODY_LIMIT, CREATE_BODY_DEADLINE_MS)); }
+  catch { return hidden(env); }
+  if (!consumeBootstrap(token, expiresAt)) { diag('session_create', { backend: 'stateless', status: 409 }); return hidden(env); }
+  const sessionToken = await mintToken(key, 'session', host, STATELESS_SESSION_TTL_MS);
+  diag('session_create', { backend: 'stateless', status: 200 });
+  return new Response(Uint8Array.from(encodeFrame(FrameType.Welcome, 0)).buffer, {
+    status: 200,
+    headers: {
+      'Content-Type': 'application/octet-stream', 'Cache-Control': 'no-store',
+      'X-Session-Token': sessionToken, 'X-Down-Cursor': '0', 'X-Carrier-Mode': 'websocket-lanes'
+    }
+  });
+}
+
+async function createSession(request: Request, env: Env, host: string): Promise<Response> {
   if (request.headers.has('Cookie') || request.headers.get('Content-Type') !== 'application/octet-stream') return hidden(env);
   const token = bearer(request);
   if (!token) return hidden(env);
+  // Stateless tokens are verified first (cheap HMAC); anything else falls through to the
+  // Durable Object registry, so backend switches do not break bridges already issued.
+  const stateless = await createStatelessSession(request, env, host, token);
+  if (stateless) return stateless;
   const region = tokenRegion(token);
   const registry = registryStub(env.BOOTSTRAPS, region);
   const lookup = await registry.fetch(internalRequest('/lookup', token, { method: 'POST' }));
@@ -488,22 +519,32 @@ async function createSession(request: Request, env: Env): Promise<Response> {
   return created;
 }
 
-async function deleteSession(request: Request, env: Env): Promise<Response> {
+async function deleteSession(request: Request, env: Env, host: string): Promise<Response> {
   if (request.headers.has('Cookie')) return hidden(env);
   const token = bearer(request);
   if (!token) return hidden(env);
+  const statelessExpiry = await verifyToken(await tokenKey(env), 'session', host, token);
+  if (statelessExpiry !== null) { revokeStatelessSession(token, statelessExpiry); return new Response(null, { status: 204 }); }
   const session = sessionStub(env, token);
   const response = await session.fetch(internalRequest('/close', token, { method: 'DELETE' }));
   return response.status === 204 ? response : hidden(env);
 }
 
-async function websocket(request: Request, env: Env): Promise<Response> {
+async function websocket(request: Request, env: Env, host: string): Promise<Response> {
   if (request.headers.get('Upgrade')?.toLowerCase() !== 'websocket') return hidden(env);
   const protocol = request.headers.get('Sec-WebSocket-Protocol') || '';
   const lane = parseLaneProtocol(protocol);
   const match = lane ? null : /^tproxy-v1\.([A-Za-z0-9_-]{43})$/.exec(protocol);
   const token = lane?.token ?? match?.[1];
   if (!token) return hidden(env);
+  if (lane) {
+    const expiresAt = await verifyToken(await tokenKey(env), 'session', host, lane.token);
+    if (expiresAt !== null) {
+      const response = statelessLane(env, lane.token, expiresAt, lane.streamId, protocol);
+      if (response.status !== 101) { diag('ws_upgrade_failed', { backend: 'stateless', status: response.status, lane: lane.streamId }); return hidden(env); }
+      return response;
+    }
+  }
   const session = sessionStub(env, token);
   const headers: Record<string, string> = { Upgrade: 'websocket' };
   if (lane) headers['X-Lane-Id'] = String(lane.streamId);
@@ -518,28 +559,40 @@ async function websocket(request: Request, env: Env): Promise<Response> {
   return new Response(null, { status: 101, webSocket: response.webSocket, headers: upgraded });
 }
 
+/** Opt-in readiness probe (HEALTH_PATH, e.g. a random path): 200 only when the secret parses. */
+function health(env: Env): Response {
+  try { decodeSecret(env.WEB_SECRET).fill(0); }
+  catch { return new Response('{"ok":false}', { status: 500, headers: { 'content-type': 'application/json', 'cache-control': 'no-store' } }); }
+  return new Response(JSON.stringify({ ok: true, carrier: carrierModeOf(env), backend: statelessLanes(env) ? 'stateless' : 'durable' }), { headers: { 'content-type': 'application/json', 'cache-control': 'no-store' } });
+}
+
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     configureDiagnostics(env.DIAGNOSTICS);
     const url = new URL(request.url);
+    const host = servedHost(request, env);
+    if (!host) return hidden(env);
     if (request.method === 'GET' && url.pathname === '/') {
       const match = /^\?bridge=([A-Za-z0-9_-]{43})$/.exec(url.search);
       const bridge = match?.[1];
       if (bridge) {
         let secret: Uint8Array | undefined;
         try {
-          validateHostname(env.PUBLIC_HOSTNAME);
           secret = decodeSecret(env.WEB_SECRET);
-          const expected = await deriveCapability(env.PUBLIC_HOSTNAME, secret);
-          if (constantTimeEqual(bridge, expected)) return issueBridge(request, env);
+          const expected = await deriveCapability(host, secret);
+          if (constantTimeEqual(bridge, expected)) return issueBridge(request, env, host);
         } catch { return hidden(env); }
         finally { secret?.fill(0); }
       }
     }
-    if (url.pathname === '/api/v1/session' && request.method === 'POST') return createSession(request, env);
-    if (url.pathname === '/api/v1/session' && request.method === 'DELETE') return deleteSession(request, env);
-    if (url.pathname === '/api/v1/ws' && request.method === 'GET') return websocket(request, env);
-    if (request.method === 'GET' && url.pathname === '/') return publicResponse(title(env));
+    if (env.HEALTH_PATH && url.pathname === env.HEALTH_PATH && request.method === 'GET') return health(env);
+    const api = url.pathname === '/api/v1/session' || url.pathname === '/api/v1/ws';
+    if (api && !sameOrigin(request, host)) { diag('origin_rejected', { path: url.pathname }); return hidden(env); }
+    if (url.pathname === '/api/v1/session' && request.method === 'POST') return createSession(request, env, host);
+    if (url.pathname === '/api/v1/session' && request.method === 'DELETE') return deleteSession(request, env, host);
+    if (url.pathname === '/api/v1/ws' && request.method === 'GET') return websocket(request, env, host);
+    if (url.pathname === '/' && request.method === 'GET') return publicResponse(title(env));
+    if (url.pathname === '/' && request.method === 'HEAD') { const page = publicResponse(title(env)); return new Response(null, { status: 200, headers: page.headers }); }
     return hidden(env);
   }
 };
