@@ -6,6 +6,9 @@ import { publicResponse } from './public-site';
 import { RelayCore, type TelegramConnectorLike } from './relay-core';
 import { TelegramConnector } from './mtproxy';
 import { CloudflareTelegramDialer } from './tcp';
+import { DialLimiter } from './dial-limiter';
+import { dialTelegramWss } from './wss';
+import { configureDiagnostics, diag } from './diag';
 import { DEFAULT_WEBSOCKET_BATCHER_OPTIONS, WebSocketBatcher } from './ws-batcher';
 import { IdleLiveness, SerializedInboundQueue, readBoundedBody } from './session-guards';
 import { isRegion, regionFor, regionalToken, registryStub, tokenRegion } from './region';
@@ -218,10 +221,16 @@ export class RelaySession {
   #router: LaneRouter | undefined;
   readonly #laneQueues = new Map<number, SerializedInboundQueue<Uint8Array>>();
   #laneIdle: ReturnType<typeof setTimeout> | undefined;
+  #sid = '';
+  #openedAt = 0;
+  #lanesOpened = 0;
+  #lanesRejected = 0;
 
   constructor(state: DurableObjectState, env: Env) {
     this.#state = state;
     this.#env = env;
+    configureDiagnostics(env.DIAGNOSTICS);
+    this.#sid = state.id.toString().slice(0, 8);
     state.blockConcurrencyWhile(async () => {
       this.#config = await state.storage.get<SessionConfig>('config');
       if (this.#config && this.#config.expiresAt <= Date.now()) { this.#config = undefined; await state.storage.deleteAll(); }
@@ -239,6 +248,7 @@ export class RelaySession {
       this.#config = incoming;
       await this.#state.storage.put('config', this.#config);
       await this.#state.storage.setAlarm(this.#config.expiresAt);
+      diag('session_created', { sid: this.#sid, mode: this.#config.carrierMode });
       return new Response(null, { status: 204 });
     }
     if (!this.#config || token !== this.#config.token || this.#config.expiresAt <= Date.now()) return new Response(null, { status: 404 });
@@ -249,9 +259,17 @@ export class RelaySession {
     if (url.pathname === '/ws' && request.method === 'GET') {
       const laneHeader = request.headers.get('X-Lane-Id');
       const lanesMode = this.#config.carrierMode === 'websocket-lanes';
-      if (lanesMode !== (laneHeader !== null)) return new Response(null, { status: 404 });
+      if (lanesMode !== (laneHeader !== null)) {
+        diag('ws_rejected', { sid: this.#sid, reason: 'carrier_mismatch', lane: laneHeader !== null });
+        return new Response(null, { status: 404 });
+      }
+      if (!this.#openedAt) this.#openedAt = Date.now();
       if (lanesMode) return this.#acceptLane(Number(laneHeader));
-      if (this.#socket || this.#core) return new Response(null, { status: 409 });
+      if (this.#socket || this.#core) {
+        diag('ws_rejected', { sid: this.#sid, reason: 'duplicate_carrier' });
+        return new Response(null, { status: 409 });
+      }
+      diag('carrier_open', { sid: this.#sid, mode: 'websocket' });
       const pair = new WebSocketPair();
       const [client, server] = Object.values(pair) as [WebSocket, WebSocket];
       server.accept({ allowHalfOpen: true });
@@ -302,7 +320,12 @@ export class RelaySession {
     try {
       const factory = connectorFactories.get(this);
       return new RelayCore({
-        limits: DEFAULT_LIMITS, connector: factory ? factory(secret) : new TelegramConnector(secret, new CloudflareTelegramDialer()),
+        limits: DEFAULT_LIMITS, connector: factory ? factory(secret) : new TelegramConnector(secret, new CloudflareTelegramDialer(), {
+          dialTimeoutMs: 5_000,
+          limiter: new DialLimiter(8, 256),
+          fallbackOnly: this.#env.WSS_FALLBACK === 'force',
+          fallback: this.#env.WSS_FALLBACK === '0' ? undefined : (dc, tag, signal) => dialTelegramWss(dc, tag, { timeoutMs: 10_000, signal })
+        }),
         send,
         closeCarrier: () => { void this.#close(); }
       });
@@ -325,7 +348,13 @@ export class RelaySession {
       });
     }
     const router = this.#router;
-    if (!router.canAttach(streamId)) return new Response(null, { status: 409 });
+    if (!router.canAttach(streamId)) {
+      this.#lanesRejected++;
+      diag('lane_rejected', { sid: this.#sid, stream: streamId, active: router.size, reused: router.has(streamId) ? 'active' : 'closed_or_full' });
+      return new Response(null, { status: 409 });
+    }
+    this.#lanesOpened++;
+    diag('lane_open', { sid: this.#sid, stream: streamId, active: router.size + 1, total: this.#lanesOpened, sinceSessionMs: Date.now() - this.#openedAt });
     const pair = new WebSocketPair();
     const [client, server] = Object.values(pair) as [WebSocket, WebSocket];
     server.accept({ allowHalfOpen: true });
@@ -339,7 +368,10 @@ export class RelaySession {
       handle: async (value) => {
         try {
           const error = validateLaneMessage(value, streamId, !router.isOpened(streamId));
-          if (error) throw new Error(error);
+          if (error) {
+            diag('lane_protocol_error', { sid: this.#sid, stream: streamId, error });
+            throw new Error(error);
+          }
           await this.#core?.receive(value);
           router.markOpened(streamId);
           // A client CLOSE (or refused OPEN) completes the lane.
@@ -367,6 +399,7 @@ export class RelaySession {
 
   #dropLane(streamId: number, code = 1000, reason = ''): void {
     const queue = this.#laneQueues.get(streamId);
+    if (queue || this.#router?.has(streamId)) diag('lane_closed', { sid: this.#sid, stream: streamId, code, reason: reason || 'peer_close', active: Math.max(0, (this.#router?.size ?? 1) - 1) });
     if (queue) { this.#laneQueues.delete(streamId); queue.clear(); }
     this.#router?.detach(streamId, code, reason);
     try { this.#core?.abortStream(streamId); } catch { /* already closed */ }
@@ -385,6 +418,7 @@ export class RelaySession {
 
   async #close(code = 1000, reason = ''): Promise<void> {
     if (this.#closing) return this.#closing;
+    diag('session_shutdown', { sid: this.#sid, code, reason: reason || 'normal', lifeMs: this.#openedAt ? Date.now() - this.#openedAt : 0, lanesOpened: this.#lanesOpened, lanesRejected: this.#lanesRejected });
     this.#closing = (async () => {
       const socket = this.#socket;
       this.#socket = undefined;
@@ -419,6 +453,7 @@ function sessionStub(env: Env, token: string): DurableObjectStub {
 }
 
 async function issueBridge(request: Request, env: Env): Promise<Response> {
+  diag('bridge_issued', { colo: (request.cf as { colo?: string } | undefined)?.colo, mode: carrierModeOf(env) });
   const region = regionFor(request.cf as Parameters<typeof regionFor>[0]);
   const token = regionalToken(region);
   const registry = registryStub(env.BOOTSTRAPS, region);
@@ -448,6 +483,7 @@ async function createSession(request: Request, env: Env): Promise<Response> {
       ...(region ? { [INTERNAL_REGION]: region } : {})
     }
   }));
+  diag('session_create', { status: created.status, region: region ?? 'auto' });
   if (created.status === 404 || created.status === 400) return hidden(env);
   return created;
 }
@@ -472,7 +508,10 @@ async function websocket(request: Request, env: Env): Promise<Response> {
   const headers: Record<string, string> = { Upgrade: 'websocket' };
   if (lane) headers['X-Lane-Id'] = String(lane.streamId);
   const response = await session.fetch(internalRequest('/ws', token, { headers }));
-  if (response.status !== 101) return hidden(env);
+  if (response.status !== 101) {
+    diag('ws_upgrade_failed', { status: response.status, lane: lane?.streamId });
+    return hidden(env);
+  }
   const upgraded = new Headers(response.headers);
   upgraded.set('Sec-WebSocket-Protocol', protocol);
   upgraded.set('Sec-WebSocket-Extensions', '');
@@ -481,6 +520,7 @@ async function websocket(request: Request, env: Env): Promise<Response> {
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
+    configureDiagnostics(env.DIAGNOSTICS);
     const url = new URL(request.url);
     if (request.method === 'GET' && url.pathname === '/') {
       const match = /^\?bridge=([A-Za-z0-9_-]{43})$/.exec(url.search);

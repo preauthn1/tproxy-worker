@@ -55,9 +55,18 @@ class CloudflareTelegramConnection implements DirectTelegramConnection {
 }
 
 export class CloudflareTelegramDialer implements TelegramDialer {
-  async connect(endpoint: TelegramEndpoint): Promise<DirectTelegramConnection> {
+  async connect(endpoint: TelegramEndpoint, signal?: AbortSignal): Promise<DirectTelegramConnection> {
     const socket = connect(endpoint, { allowHalfOpen: false });
-    await socket.opened;
+    const abort = () => { try { socket.close(); } catch { /* already closed */ } };
+    signal?.addEventListener('abort', abort, { once: true });
+    try {
+      if (signal?.aborted) throw new Error('dial cancelled');
+      await socket.opened;
+      if (signal?.aborted) throw new Error('dial cancelled');
+    } catch (error) {
+      abort();
+      throw error;
+    } finally { signal?.removeEventListener('abort', abort); }
     return new CloudflareTelegramConnection(socket);
   }
 }

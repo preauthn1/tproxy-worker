@@ -1,3 +1,4 @@
+import { diag, errorKind } from './diag';
 import { FrameType, INITIAL_STREAM_CREDIT, RELAY_DATA_CHUNK, encodeFrame, parseClientBatch, windowAmount, windowPayload, type Frame } from './frame';
 import { GrainCollector } from './grain';
 import { DEFAULT_LIMITS, QUEUE_ITEM_COST, type RelayLimits } from './limits';
@@ -15,7 +16,7 @@ export interface TelegramConnection {
 }
 
 export interface TelegramConnectorLike {
-  open(): TelegramConnection;
+  open(streamId?: number): TelegramConnection;
   close?(): void;
 }
 
@@ -32,6 +33,11 @@ interface StreamState {
   pendingWriteCost: number;
   pendingWriteItems: number;
   pendingWindow: number;
+  openedAt: number;
+  upBytes: number;
+  downBytes: number;
+  firstDownMs: number;
+  closeReason?: string;
 }
 
 export interface RelayCoreOptions {
@@ -153,13 +159,15 @@ export class RelayCore {
         if (frame.streamId === 0) continue;
         if (frame.type === FrameType.Open) {
           if (this.#streams.size >= this.#limits.maxStreams) {
+            diag('stream_refused', { stream: frame.streamId, reason: 'max_streams', active: this.#streams.size });
             this.#rememberClosed(frame.streamId);
             this.#sendControl(encodeFrame(FrameType.Close, frame.streamId));
             continue;
           }
           let connection: TelegramConnection;
-          try { connection = this.#options.connector.open(); }
-          catch {
+          try { connection = this.#options.connector.open(frame.streamId); }
+          catch (error) {
+            diag('stream_refused', { stream: frame.streamId, reason: errorKind(error) });
             this.#rememberClosed(frame.streamId);
             this.#sendControl(encodeFrame(FrameType.Close, frame.streamId));
             continue;
@@ -176,14 +184,20 @@ export class RelayCore {
             writeWaiters: [],
             pendingWriteCost: 0,
             pendingWriteItems: 0,
-            pendingWindow: 0
+            pendingWindow: 0,
+            openedAt: Date.now(),
+            upBytes: 0,
+            downBytes: 0,
+            firstDownMs: -1
           };
+          diag('stream_open', { stream: frame.streamId, active: this.#streams.size + 1 });
           this.#streams.set(frame.streamId, stream);
           this.#background(this.#pumpBackend(frame.streamId, stream));
         } else if (frame.type === FrameType.Data) {
           const stream = this.#streams.get(frame.streamId);
           if (!stream) continue;
           stream.receiveCredit -= frame.payload.byteLength;
+          stream.upBytes += frame.payload.byteLength;
           let collector = uploads.get(frame.streamId);
           if (!collector) {
             collector = new GrainCollector(RELAY_DATA_CHUNK);
@@ -203,7 +217,11 @@ export class RelayCore {
             for (const wake of stream.creditWaiters.splice(0)) wake();
             for (const wake of this.#downlinkWaiters.splice(0)) wake();
           }
-        } else if (frame.type === FrameType.Close) this.#closeStream(frame.streamId, false);
+        } else if (frame.type === FrameType.Close) {
+          const stream = this.#streams.get(frame.streamId);
+          if (stream) stream.closeReason ??= 'client_close';
+          this.#closeStream(frame.streamId, false);
+        }
       }
       for (const [id, collector] of uploads) {
         const stream = this.#streams.get(id);
@@ -259,7 +277,8 @@ export class RelayCore {
           await new Promise<void>((resolve) => setTimeout(resolve, 0));
         }
       }
-    } catch {
+    } catch (error) {
+      stream.closeReason ??= `backend_write: ${errorKind(error)}`;
       this.#closeStream(id, true, stream);
     } finally { stream.writerRunning = false; }
   }
@@ -297,6 +316,8 @@ export class RelayCore {
     try {
       for await (const value of connection.read()) {
         if (this.#ended || this.#streams.get(id) !== streamIdentity) return;
+        if (streamIdentity.firstDownMs < 0) streamIdentity.firstDownMs = Date.now() - streamIdentity.openedAt;
+        streamIdentity.downBytes += value.byteLength;
         let offset = 0;
         while (offset < value.byteLength) {
           let stream = this.#streams.get(id);
@@ -326,7 +347,10 @@ export class RelayCore {
           offset += length;
         }
       }
-    } catch { /* backend failure is represented by CLOSE */ }
+      streamIdentity.closeReason ??= 'backend_eof';
+    } catch (error) {
+      streamIdentity.closeReason ??= `backend_read: ${errorKind(error)}`;
+    }
     if (!this.#ended && this.#streams.get(id) === streamIdentity) this.#closeStream(id, true, streamIdentity);
   }
 
@@ -334,6 +358,15 @@ export class RelayCore {
     const stream = this.#streams.get(id);
     if (!stream || (expected && stream !== expected)) return;
     this.#streams.delete(id);
+    diag('stream_closed', {
+      stream: id,
+      reason: stream.closeReason ?? (notify ? 'relay_close' : 'aborted'),
+      lifeMs: Date.now() - stream.openedAt,
+      firstDownMs: stream.firstDownMs,
+      up: stream.upBytes,
+      down: stream.downBytes,
+      stalled: stream.firstDownMs < 0 && stream.upBytes > 0
+    });
     this.#pendingDownlinkBytes -= stream.pendingDownlinkBytes;
     this.#releasePending(stream.pendingWriteCost, stream.pendingWriteItems);
     stream.pendingWriteCost = 0;

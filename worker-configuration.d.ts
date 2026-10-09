@@ -4,6 +4,8 @@ declare namespace Cloudflare {
     PUBLIC_HOSTNAME: string;
     PUBLIC_SITE_TITLE?: string;
     CARRIER_MODE?: string;
+    DIAGNOSTICS?: string;
+    WSS_FALLBACK?: string;
     BOOTSTRAPS: DurableObjectNamespace;
     SESSIONS: DurableObjectNamespace;
   }

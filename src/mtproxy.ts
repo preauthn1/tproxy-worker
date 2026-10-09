@@ -3,10 +3,24 @@
 // f36d8af769ffaeac36978d38c2c0f6d1104c2137 (LGPL-2.0-or-later).
 import { StreamingAes256Ctr } from './aes-ctr';
 import { telegramDcCandidates, type TelegramEndpoint } from './telegram-dc';
+import type { DialLimiter } from './dial-limiter';
+import { diag, errorKind } from './diag';
 
 const HEADER_BYTES = 64;
 const DEFAULT_HANDSHAKE_TIMEOUT_MS = 30_000;
 const VALID_TAGS = new Set([0xeeeeeeee, 0xdddddddd, 0xefefefef]);
+/** Outbound fallback dialer (e.g. Telegram web WSS); receives the validated signed DC and transport tag. */
+export type TelegramFallbackDialer = (signedDc: number, tag: number, signal: AbortSignal) => Promise<DirectTelegramConnection>;
+
+export interface MtProxyOptions {
+  handshakeTimeoutMs?: number;
+  dialTimeoutMs?: number;
+  limiter?: DialLimiter;
+  fallback?: TelegramFallbackDialer | undefined;
+  /** Skip TCP and use only the fallback dialer. */
+  fallbackOnly?: boolean;
+  streamId?: number;
+}
 
 function transportMarker(tag: number): Uint8Array {
   if (tag === 0xeeeeeeee) return Uint8Array.of(0xee, 0xee, 0xee, 0xee);
@@ -15,13 +29,30 @@ function transportMarker(tag: number): Uint8Array {
   throw new Error('invalid MTProxy transport tag');
 }
 
+const DEFAULT_DIAL_TIMEOUT_MS = 5_000;
+
+function withTimeout<T>(promise: Promise<T>, ms: number, onLate: (value: T) => void): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    let settled = false;
+    const timer = setTimeout(() => { settled = true; reject(new Error('dial timeout')); }, ms);
+    promise.then((value) => {
+      if (settled) { onLate(value); return; }
+      settled = true; clearTimeout(timer); resolve(value);
+    }, (error: unknown) => {
+      if (settled) return;
+      settled = true; clearTimeout(timer);
+      reject(error instanceof Error ? error : new Error('dial failed'));
+    });
+  });
+}
+
 export interface DirectTelegramConnection {
   write(data: Uint8Array): Promise<void>;
   read(): AsyncIterable<Uint8Array>;
   close(): void;
 }
 
-export interface TelegramDialer { connect(endpoint: TelegramEndpoint): Promise<DirectTelegramConnection> }
+export interface TelegramDialer { connect(endpoint: TelegramEndpoint, signal?: AbortSignal): Promise<DirectTelegramConnection> }
 
 function concatenate(...values: Uint8Array[]): Uint8Array {
   const output = new Uint8Array(values.reduce((sum, value) => sum + value.byteLength, 0));
@@ -56,8 +87,12 @@ export class MtProxyTerminator implements DirectTelegramConnection {
   readonly #resolveReady: () => void;
   readonly #rejectReady: (error: Error) => void;
   readonly #handshakeTimer: ReturnType<typeof setTimeout>;
+  readonly #options: MtProxyOptions;
+  readonly #abort = new AbortController();
 
-  constructor(secret: Uint8Array, dialer: TelegramDialer, handshakeTimeoutMs = DEFAULT_HANDSHAKE_TIMEOUT_MS) {
+  constructor(secret: Uint8Array, dialer: TelegramDialer, options: MtProxyOptions | number = {}) {
+    this.#options = typeof options === 'number' ? { handshakeTimeoutMs: options } : options;
+    const handshakeTimeoutMs = this.#options.handshakeTimeoutMs ?? DEFAULT_HANDSHAKE_TIMEOUT_MS;
     this.#secret = normalizeMtProxySecret(secret);
     this.#dialer = dialer;
     let resolveReady!: () => void;
@@ -105,6 +140,7 @@ export class MtProxyTerminator implements DirectTelegramConnection {
   close(error = new Error('MTProxy terminator closed')): void {
     if (this.#closed) return;
     this.#closed = true;
+    this.#abort.abort();
     clearTimeout(this.#handshakeTimer);
     this.#settleReady(error);
     this.#connection?.close();
@@ -135,25 +171,56 @@ export class MtProxyTerminator implements DirectTelegramConnection {
       const marker = transportMarker(tag);
       const dc = view.getInt16(60, true);
       const candidates = telegramDcCandidates(dc);
-      let lastError: unknown;
-      for (const endpoint of candidates) {
-        if (this.#closed) throw new Error('MTProxy terminator closed');
-        let connection: DirectTelegramConnection | undefined;
-        try {
-          connection = await this.#dialer.connect(endpoint);
-          if (this.#closed) { connection.close(); throw new Error('MTProxy terminator closed'); }
-          await connection.write(marker);
-          if (this.#closed) { connection.close(); throw new Error('MTProxy terminator closed'); }
-          this.#connection = connection;
-          clearTimeout(this.#handshakeTimer);
-          this.#settleReady();
-          return;
-        } catch (error) {
-          connection?.close();
-          lastError = error;
+      const streamId = this.#options.streamId;
+      const started = Date.now();
+      let release: (() => void) | undefined;
+      try {
+        if (this.#options.limiter) {
+          const queuedAt = Date.now();
+          release = await this.#options.limiter.acquire(this.#abort.signal);
+          const waited = Date.now() - queuedAt;
+          if (waited > 50) diag('dial_queued', { stream: streamId, dc, waitMs: waited });
         }
-      }
-      throw lastError instanceof Error ? lastError : new Error('Telegram DC dial failed');
+        let lastError: unknown;
+        for (const endpoint of this.#options.fallbackOnly ? [] : candidates) {
+          if (this.#closed) throw new Error('MTProxy terminator closed');
+          const attemptAt = Date.now();
+          let connection: DirectTelegramConnection | undefined;
+          try {
+            connection = await withTimeout(
+              this.#dialer.connect(endpoint, this.#abort.signal),
+              this.#options.dialTimeoutMs ?? DEFAULT_DIAL_TIMEOUT_MS,
+              (late) => late.close()
+            );
+            if (this.#closed) { connection.close(); throw new Error('MTProxy terminator closed'); }
+            await connection.write(marker);
+            if (this.#closed) { connection.close(); throw new Error('MTProxy terminator closed'); }
+            this.#adopt(connection);
+            diag('dc_connected', { stream: streamId, dc, via: 'tcp', ipv6: endpoint.hostname.includes(':'), connectMs: Date.now() - attemptAt, totalMs: Date.now() - started });
+            return;
+          } catch (error) {
+            connection?.close();
+            lastError = error;
+            if (this.#closed) throw error;
+            diag('dc_dial_failed', { stream: streamId, dc, via: 'tcp', ipv6: endpoint.hostname.includes(':'), ms: Date.now() - attemptAt, error: errorKind(error) });
+          }
+        }
+        const fallback = this.#options.fallback;
+        if (fallback && !this.#closed) {
+          const attemptAt = Date.now();
+          try {
+            const connection = await fallback(dc, tag, this.#abort.signal);
+            if (this.#closed) { connection.close(); throw new Error('MTProxy terminator closed'); }
+            this.#adopt(connection);
+            diag('dc_connected', { stream: streamId, dc, via: 'wss', connectMs: Date.now() - attemptAt, totalMs: Date.now() - started });
+            return;
+          } catch (error) {
+            lastError = error;
+            diag('dc_dial_failed', { stream: streamId, dc, via: 'wss', ms: Date.now() - attemptAt, error: errorKind(error) });
+          }
+        }
+        throw lastError instanceof Error ? lastError : new Error('Telegram DC dial failed');
+      } finally { release?.(); }
     } catch (error) {
       this.close(error instanceof Error ? error : new Error('MTProxy initialization failed'));
       throw error;
@@ -161,6 +228,12 @@ export class MtProxyTerminator implements DirectTelegramConnection {
       source.fill(0); iv.fill(0); reversed.fill(0); outboundSource.fill(0); outboundIv.fill(0);
       inboundKey.fill(0); outboundKey.fill(0); decrypted.fill(0);
     }
+  }
+
+  #adopt(connection: DirectTelegramConnection): void {
+    this.#connection = connection;
+    clearTimeout(this.#handshakeTimer);
+    this.#settleReady();
   }
 
   #settleReady(error?: Error): void {
@@ -174,18 +247,21 @@ export class MtProxyTerminator implements DirectTelegramConnection {
 export class TelegramConnector {
   readonly #secret: Uint8Array;
   readonly #dialer: TelegramDialer;
+  readonly #options: MtProxyOptions;
   #closed = false;
-  constructor(secret: Uint8Array, dialer: TelegramDialer) {
+  constructor(secret: Uint8Array, dialer: TelegramDialer, options: MtProxyOptions = {}) {
     this.#secret = normalizeMtProxySecret(secret);
     this.#dialer = dialer;
+    this.#options = options;
   }
-  open(): MtProxyTerminator {
+  open(streamId?: number): MtProxyTerminator {
     if (this.#closed) throw new Error('Telegram connector closed');
-    return new MtProxyTerminator(this.#secret, this.#dialer);
+    return new MtProxyTerminator(this.#secret, this.#dialer, streamId === undefined ? this.#options : { ...this.#options, streamId });
   }
   close(): void {
     if (this.#closed) return;
     this.#closed = true;
+    this.#options.limiter?.close();
     this.#secret.fill(0);
   }
 }
